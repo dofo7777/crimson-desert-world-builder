@@ -33,7 +33,7 @@ namespace cdk {
     extern thread_local GuardFrame* t_guardTop;   // innermost active guard of this thread (defined in cdmodkit.cpp)
     // Registers itself on construction and leaves on destruction, so a `return` inside the guarded region (ReadBytes returns
     // from within it) still unregisters the frame: a stale frame here would send the next fault into a dead stack frame.
-    struct GuardFrame { intptr_t jb[5]; GuardFrame* prev; GuardFrame() : prev(t_guardTop) { t_guardTop = this; } ~GuardFrame() { t_guardTop = prev; } };
+    struct GuardFrame { void* jb[5] = {}; GuardFrame* prev; GuardFrame() : prev(t_guardTop) { t_guardTop = this; } ~GuardFrame() { t_guardTop = prev; } };
     // Called by the vectored handler on the faulting thread. Returns only when no guard is active.
     inline void GuardDispatch(EXCEPTION_POINTERS* ep) {
         GuardFrame* f = t_guardTop; if (!f) return;

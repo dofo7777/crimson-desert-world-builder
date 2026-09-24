@@ -17,8 +17,8 @@ struct SpawnedObj { uintptr_t obj; std::string prefab; Vec3 pos; Rot rot; float 
 namespace core {
     extern uintptr_t g_base;
     extern bool      g_menuOpen;      // set by the editor UI
-    extern bool      g_uiWantsMouse;  // cursor is over a World Builder window (ImGui WantCaptureMouse), updated every frame
-    extern bool      g_uiWantsKeyboard; // a text field is active (ImGui WantTextInput)
+    extern bool      g_uiWantsMouse;  // World Builder consumes mouse input while its editor is open
+    extern bool      g_uiWantsKeyboard; // World Builder consumes keyboard input while its editor is open
     extern bool      g_placing;         // placement mode: arrow/numpad/Enter/Backspace go to World Builder, everything else to the game
 
     void Log(const char* fmt, ...);
@@ -35,6 +35,11 @@ namespace core {
     bool SetPlayerPos(Vec3 world);             // writes the transform component (experimental: the game may correct it)
     bool CameraPose(Vec3* fwd, Vec3* pos);     // horizontal view direction (local +Z of the camera object) and world position of the active camera
     bool CameraBasis(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd);   // full camera frame from the camera object's quaternion (fwd = local +Z, sign applied by the editor)
+    void CameraControlStart();                // captures the live camera on the game thread and starts overriding its transform
+    void CameraControlStop();                 // restores the captured transform on the game thread
+    bool CameraControlActive();
+    void CameraControlStep(float forward, float right, float up, float yaw, float pitch, float zoom, float dt, bool fast);
+    void CameraControlLook(float dx, float dy);
     extern float g_fovDeg; extern bool g_camMirror; extern bool g_fovAuto;   // projection settings (settings.txt fov=, mirror=, fovauto=)
     extern int g_camLag;                                                     // settings.txt camlag=: frames the overlay camera trails the game camera (the game simulates ahead of the frame on screen)
     bool CameraFov(float* deg);                // live vertical field of view read from the camera object (PhotoCamera +0x1DC), false if implausible

@@ -15,6 +15,7 @@ namespace input {
     static HWND    g_hwnd = nullptr;
     static CRITICAL_SECTION g_cs; static bool g_csReady = false;
     static float g_vx = 0, g_vy = 0;
+    static float g_pendingDx = 0, g_pendingDy = 0;
     static bool  g_rawButtons = false;
     static int   g_pendingButtons[5][2];
     static float g_pendingWheel = 0;
@@ -51,6 +52,8 @@ namespace input {
         } else {
             g_vx += static_cast<float>(m.lLastX);
             g_vy += static_cast<float>(m.lLastY);
+            g_pendingDx += static_cast<float>(m.lLastX);
+            g_pendingDy += static_cast<float>(m.lLastY);
         }
         if (g_vx < 0) g_vx = 0;
         if (g_vy < 0) g_vy = 0;
@@ -83,6 +86,13 @@ namespace input {
         if (g_pendingWheel != 0) { if (toUi) io.AddMouseWheelEvent(0, g_pendingWheel); g_pendingWheel = 0; }
         Unlock();
     }
+    void TakeMouseDelta(float* dx, float* dy) {
+        Lock();
+        if (dx) *dx = g_pendingDx;
+        if (dy) *dy = g_pendingDy;
+        g_pendingDx = g_pendingDy = 0;
+        Unlock();
+    }
 
     // ImGui's Win32 backend polls GetCursorPos every frame; on the render thread while the menu is open it gets the virtual cursor.
     static BOOL WINAPI hkGetCursorPos(LPPOINT p) {
@@ -112,25 +122,25 @@ namespace input {
 
     void MenuOpened() {
         int w, h; ClientSize(&w, &h);
-        Lock(); g_vx = w * 0.5f; g_vy = h * 0.5f; for (auto& b : g_pendingButtons) b[0] = b[1] = 0; g_pendingWheel = 0; Unlock();
+        Lock(); g_vx = w * 0.5f; g_vy = h * 0.5f; g_pendingDx = g_pendingDy = 0; for (auto& b : g_pendingButtons) b[0] = b[1] = 0; g_pendingWheel = 0; Unlock();
     }
     void MenuClosed() {}
 
     // scan code key state: set on key-down, cleared on key-up (both extended variants: Shift+Numpad flips the flag), on focus loss
     // and when the placement mode starts/ends. No time-out: Windows auto-repeats only the last pressed key, so a held key may stay silent.
-    static bool g_scanDown[512] = { false };
+    static volatile LONG g_scanDown[512] = {};
     static void TrackKey(UINT msg, LPARAM lParam) {
         const int scan = (int)((lParam >> 16) & 0xFF), ext = (int)((lParam >> 24) & 1);
-        if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) g_scanDown[scan | (ext << 8)] = true;
+        if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) InterlockedExchange(&g_scanDown[scan | (ext << 8)], 1);
         else if (msg == WM_KEYUP || msg == WM_SYSKEYUP) {
             // Shift + numpad: Windows inserts a fake extended Shift-up (E0 2A) around the key; only that variant is cleared for
             // the shift keys so the real Shift stays 'down'. Other keys clear both variants (the up event may arrive in the other form).
-            if ((scan == 0x2A || scan == 0x36) && ext) g_scanDown[scan | 256] = false;
-            else { g_scanDown[scan] = false; g_scanDown[scan | 256] = false; }
+            if ((scan == 0x2A || scan == 0x36) && ext) InterlockedExchange(&g_scanDown[scan | 256], 0);
+            else { InterlockedExchange(&g_scanDown[scan], 0); InterlockedExchange(&g_scanDown[scan | 256], 0); }
         }
     }
-    bool ScanDown(int scan, bool ext) { return g_scanDown[(scan & 0xFF) | (ext ? 256 : 0)]; }
-    void ClearKeys() { memset(g_scanDown, 0, sizeof g_scanDown); }
+    bool ScanDown(int scan, bool ext) { return InterlockedCompareExchange(&g_scanDown[(scan & 0xFF) | (ext ? 256 : 0)], 0, 0) != 0; }
+    void ClearKeys() { for (int i = 0; i < 512; ++i) InterlockedExchange(&g_scanDown[i], 0); }
     // Numpad keys share their scan code with the navigation keys (Home = E0 47 = Numpad 7 etc.). The extended variant only counts
     // while Shift is held, because Shift + numpad arrives as the extended code; a plain Home / End / PgUp / Insert / Delete is ignored.
     // Numpad Enter (E0 1C) and Numpad / (E0 35) are always extended and always accepted.
@@ -167,11 +177,10 @@ namespace input {
     }
     static bool IsKeyboard(UINT m) { return m == WM_KEYDOWN || m == WM_KEYUP || m == WM_SYSKEYDOWN || m == WM_SYSKEYUP || m == WM_CHAR || m == WM_SYSCHAR; }
 
-    // While the menu is open the game keeps running and stays controllable: the mouse belongs to the menu only while the
-    // cursor is over a World Builder window (core::g_uiWantsMouse), the keyboard only while a text field is active (g_uiWantsKeyboard).
+    // The game keeps running while the editor is open, but input owned by World Builder is swallowed before it reaches the game.
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (IsKeyboard(msg)) TrackKey(msg, lParam);
-        if (msg == WM_KILLFOCUS || (msg == WM_ACTIVATE && LOWORD(wParam) == WA_INACTIVE)) memset(g_scanDown, 0, sizeof g_scanDown);
+        if (msg == WM_KILLFOCUS || (msg == WM_ACTIVATE && LOWORD(wParam) == WA_INACTIVE)) ClearKeys();
         if (core::g_menuOpen) {
             const bool mouseToUi = core::g_uiWantsMouse, keysToUi = core::g_uiWantsKeyboard;
             if (msg == WM_INPUT) {
@@ -189,7 +198,6 @@ namespace input {
                 if (!keysToUi && core::g_placing && IsPlaceKey(wParam)) return 0;   // placement keys belong to World Builder while carrying an object
                 if (keysToUi) {
                     ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam);
-                    if (msg == WM_KEYUP || msg == WM_SYSKEYUP) return CallWindowProc(g_original, hwnd, msg, wParam, lParam);
                     return 0;
                 }
                 return CallWindowProc(g_original, hwnd, msg, wParam, lParam);

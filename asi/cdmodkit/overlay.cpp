@@ -34,15 +34,19 @@ void* CdHeapAlloc(size_t n); void* CdHeapRealloc(void* p, size_t n); void CdHeap
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 
-namespace editor { void Draw(); void Toggle(); bool IsOpen(); void ApplyStyle(float scale); bool PlayMode(); void TogglePlay(); bool Placing(); bool MouseMode(); }
+namespace editor { void Draw(); void Toggle(); bool IsOpen(); void ApplyStyle(float scale); bool CameraMode(); void ToggleCameraMode(); bool Placing(); bool MouseMode(); }
 
 namespace overlay {
     typedef HRESULT (STDMETHODCALLTYPE* FactoryCreateSwapChainForHwnd_t)(IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+    typedef HRESULT (STDMETHODCALLTYPE* FactoryCreateSwapChainForCoreWindow_t)(IDXGIFactory2*, IUnknown*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
+    typedef HRESULT (STDMETHODCALLTYPE* FactoryCreateSwapChainForComposition_t)(IDXGIFactory2*, IUnknown*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*, IDXGISwapChain1**);
     typedef HRESULT (WINAPI* Present_t)(IDXGISwapChain3*, UINT, UINT);
     typedef HRESULT (WINAPI* Present1_t)(IDXGISwapChain3*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
     typedef HRESULT (WINAPI* ResizeBuffers_t)(IDXGISwapChain3*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 
     static FactoryCreateSwapChainForHwnd_t oCreateSwapChainForHwnd = nullptr;
+    static FactoryCreateSwapChainForCoreWindow_t oCreateSwapChainForCoreWindow = nullptr;
+    static FactoryCreateSwapChainForComposition_t oCreateSwapChainForComposition = nullptr;
     static Present_t oPresent = nullptr;
     static Present1_t oPresent1 = nullptr;
     static ResizeBuffers_t oResizeBuffers = nullptr;
@@ -272,10 +276,9 @@ namespace overlay {
         editor::Draw();
         Stage("imgui render");
         ImGui::Render();
-        // edit mode: every input belongs to the menu (the game keeps running but does not react); play mode / placement: everything to the game
-        { const bool edit = editor::IsOpen() && !editor::PlayMode();
-          const bool gizmo = editor::Placing() && editor::MouseMode();   // Numpad 5 while placing: the mouse drives the gizmo instead of the camera
-          core::g_uiWantsMouse = edit || gizmo; core::g_uiWantsKeyboard = edit; }
+        // The editor owns all input while open; with the dock closed, placement only captures input used by its gizmo.
+        { const bool open = editor::IsOpen(); const bool gizmo = editor::Placing() && editor::MouseMode();
+          core::g_uiWantsMouse = open || gizmo; core::g_uiWantsKeyboard = open || editor::CameraMode(); }
 
         const UINT idx = sc->GetCurrentBackBufferIndex();
         if (idx >= g_frames.size()) return;
@@ -313,22 +316,24 @@ namespace overlay {
     }
 
     static void OnPresent(IDXGISwapChain3* sc) {
-        g_presents++;
+        if (g_presents.fetch_add(1, std::memory_order_relaxed) == 0) core::Log("[overlay] first Present reached (%p)", (void*)sc);
         if (g_disabled || g_failed || !g_queue) return;
         if (!g_ready) { if (Init(sc)) g_ready = true; else { g_failed = true; core::Log("[overlay] init failed; overlay disabled"); return; } }
         // toggle key handled here so it works without the console: Insert
         static bool s_insDown = false;
         bool down = (GetAsyncKeyState(core::g_keyToggle) & 0x8000) != 0;
-        if (down && !s_insDown) editor::Toggle();
+        if (down && !s_insDown) { editor::Toggle(); core::Log("[overlay] editor %s with %s", editor::IsOpen() ? "opened" : "closed", core::KeyName(core::g_keyToggle)); }
         s_insDown = down;
-        static bool s_homeDown = false;   // Home switches between edit mode (menu takes all input) and play mode (game takes all input)
+        static bool s_homeDown = false;   // Home toggles the free camera while the editor stays docked and keeps input
         bool home = (GetAsyncKeyState(core::g_keyMode) & 0x8000) != 0;
-        if (home && !s_homeDown && editor::IsOpen()) editor::TogglePlay();
+        if (home && !s_homeDown && (editor::IsOpen() || editor::Placing())) editor::ToggleCameraMode();
         s_homeDown = home;
         bool open = editor::IsOpen() || editor::Placing();
         if (open != g_wasOpen) { if (open) input::MenuOpened(); else input::MenuClosed(); g_wasOpen = open; }
         core::g_menuOpen = open;
         if (!open) { core::g_uiWantsMouse = false; core::g_uiWantsKeyboard = false; return; }
+        core::g_uiWantsMouse = editor::IsOpen() || (editor::Placing() && editor::MouseMode());
+        core::g_uiWantsKeyboard = editor::IsOpen() || editor::CameraMode();
         RenderGuarded(sc);
     }
 
@@ -354,6 +359,11 @@ namespace overlay {
     }
     static void HookFrom(IDXGISwapChain1* chain, IUnknown* queueUnk) {
         if (!chain) return;
+        DXGI_SWAP_CHAIN_DESC desc = {};
+        if (FAILED(chain->GetDesc(&desc)) || !IsWindow(desc.OutputWindow)) {
+            core::Log("[overlay] swapchain has no usable HWND; Win32 editor input cannot attach to it");
+            return;
+        }
         PinQueue(queueUnk);           // every real creation re-pins: the game replaced its chain once already at startup
         if (g_targetsHooked) return;
         g_targetsHooked = true;
@@ -375,6 +385,26 @@ namespace overlay {
         return hr;
     }
 
+    static HRESULT STDMETHODCALLTYPE hkCreateSwapChainForCoreWindow(IDXGIFactory2* self, IUnknown* device, IUnknown* window,
+                                                                     const DXGI_SWAP_CHAIN_DESC1* desc, IDXGIOutput* out, IDXGISwapChain1** pp) {
+        HRESULT hr = oCreateSwapChainForCoreWindow(self, device, window, desc, out, pp);
+        if (SUCCEEDED(hr) && pp && *pp && desc && desc->Width > 64 && desc->Height > 64) {
+            core::Log("[overlay] game created CoreWindow swapchain %ux%u fmt %d buffers %u", desc->Width, desc->Height, (int)desc->Format, desc->BufferCount);
+            HookFrom(*pp, device);
+        } else if (FAILED(hr)) core::Log("[overlay] the game's CreateSwapChainForCoreWindow failed: 0x%08x", (unsigned)hr);
+        return hr;
+    }
+
+    static HRESULT STDMETHODCALLTYPE hkCreateSwapChainForComposition(IDXGIFactory2* self, IUnknown* device, IUnknown* window,
+                                                                     const DXGI_SWAP_CHAIN_DESC1* desc, IDXGISwapChain1** pp) {
+        HRESULT hr = oCreateSwapChainForComposition(self, device, window, desc, pp);
+        if (SUCCEEDED(hr) && pp && *pp && desc && desc->Width > 64 && desc->Height > 64) {
+            core::Log("[overlay] game created composition swapchain %ux%u fmt %d buffers %u", desc->Width, desc->Height, (int)desc->Format, desc->BufferCount);
+            HookFrom(*pp, device);
+        } else if (FAILED(hr)) core::Log("[overlay] the game's CreateSwapChainForComposition failed: 0x%08x", (unsigned)hr);
+        return hr;
+    }
+
     void Install() {
         IDXGIFactory2* factory = nullptr;
         if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory))) || !factory) {
@@ -385,6 +415,14 @@ namespace overlay {
         if (MH_CreateHook(fn, (void*)&hkCreateSwapChainForHwnd, (void**)&oCreateSwapChainForHwnd) == MH_OK && MH_EnableHook(fn) == MH_OK)
             core::Log("[overlay] CreateSwapChainForHwnd detoured (%p); waiting for the game's swapchain", fn);
         else core::Log("[overlay] could not detour CreateSwapChainForHwnd");
+        fn = vt[16];
+        if (MH_CreateHook(fn, (void*)&hkCreateSwapChainForCoreWindow, (void**)&oCreateSwapChainForCoreWindow) == MH_OK && MH_EnableHook(fn) == MH_OK)
+            core::Log("[overlay] CreateSwapChainForCoreWindow detoured (%p)", fn);
+        else core::Log("[overlay] could not detour CreateSwapChainForCoreWindow");
+        fn = vt[24];
+        if (MH_CreateHook(fn, (void*)&hkCreateSwapChainForComposition, (void**)&oCreateSwapChainForComposition) == MH_OK && MH_EnableHook(fn) == MH_OK)
+            core::Log("[overlay] CreateSwapChainForComposition detoured (%p)", fn);
+        else core::Log("[overlay] could not detour CreateSwapChainForComposition");
         factory->Release();
     }
 }

@@ -316,7 +316,7 @@ using SetWorldTransformFn = void (*)(void* obj, const float* xf, uint8_t a, uint
 // SceneObject::setEnable(this, bool): toggles bit 3 of the flags at +0xFD and propagates to children and render
 // instances. The housing system calls it with 1 after placing a part and with 0 before tearing it down (67 callers).
 using SetEnableFn = void (*)(void* obj, uint8_t enable);
-bool g_recreateOnMove = true;
+bool g_recreateOnMove = false;   // in-place position moves avoid a visible respawn; rotation/scale changes still recreate as needed
 static bool CheckSO(uintptr_t obj, const char* what) {
     const char* n = RttiName(obj);
     if (!n || !strstr(n, "SceneObject")) { Log("%s: %p is not a SceneObject any more (%s)", what, (void*)obj, n ? n : "?"); return false; }
@@ -396,6 +396,18 @@ bool GameReadFile(const std::string& path, std::vector<uint8_t>& out) {
 // ---- game call tracing (reverse engineering aid, console "trace on|off"): logs the game's own setWorldTransform / setEnable calls
 // with the caller RVA, every object the game creates, and transform changes of the most recently created game object per tick.
 static SetWorldTransformFn g_origSetXf = nullptr; static SetEnableFn g_origSetEnable = nullptr;
+struct CameraControlState {
+    bool active = false;
+    uintptr_t object = 0;
+    float original[11] = {};
+    Vec3 pos{};
+    float yaw = 0, pitch = 0, roll = 0;
+};
+static std::mutex g_cameraControlMutex;
+static CameraControlState g_cameraControl;
+static uintptr_t CameraSceneObject();
+static void ApplyCameraControl();
+static bool CameraControlTransform(uintptr_t object, float* out);
 static std::map<uintptr_t, long> g_traceCallers; static long g_traceLines = 0; static DWORD g_traceSec = 0;
 static bool TraceBudget() { DWORD s = GetTickCount() / 1000; if (s != g_traceSec) { g_traceSec = s; g_traceLines = 0; } return g_traceLines++ < 80; }
 static void __fastcall HookSetXf(void* obj, const float* xf, uint8_t a, uint8_t b) {
@@ -406,7 +418,9 @@ static void __fastcall HookSetXf(void* obj, const float* xf, uint8_t a, uint8_t 
         if (TraceBudget()) Log("[trace] setWorldTransform obj=%p (%s) from rva 0x%llx flags=%d,%d pos=(%.2f %.2f %.2f) scale=%.2f", obj,
             RttiName((uintptr_t)obj) ? RttiName((uintptr_t)obj) : "?", (unsigned long long)(ret - g_base), a, b, t[7], t[8], t[9], t[0]);
     }
-    g_origSetXf(obj, xf, a, b);
+    alignas(16) float controlled[12];
+    if (CameraControlTransform((uintptr_t)obj, controlled)) g_origSetXf(obj, controlled, a, b);
+    else g_origSetXf(obj, xf, a, b);
 }
 static void __fastcall HookSetEnable(void* obj, uint8_t enable) {
     uintptr_t ret = (uintptr_t)_ReturnAddress();
@@ -435,10 +449,12 @@ void SetTrace(bool on) {
 bool Trace() { return g_trace; }
 // live dragging: selectable method (console: livemode N) 0 = disable/setTransform/enable, 1 = setTransform(0,0), 2 = setTransform(0,1), 3 = setTransform(0,0)+enable
 // 1 = transform only: on build 2944 the disable/enable sequence (mode 0) hides the object and the re-add happens asynchronously,
-// so an object that is updated every frame never comes back. The final drop always re-creates (g_recreateOnMove) for a clean state.
+// so an object that is updated every frame never comes back. Final drops recreate only when requested or when rotation/scale changed.
 // 2 = setWorldTransform(0,1): remove + re-insert per update, visible but may flicker; 1 = (0,0) leaves the object invisible until
 // re-inserted; 0 = disable/enable hides it (async re-add). Release/drop always re-creates.
-int g_liveMode = 2;
+// Mode 3 updates in place and re-enables the object. Mode 2 removes/re-inserts on every drag update,
+// which can visibly flicker when the editor is moving objects continuously.
+int g_liveMode = 3;
 static void DoLiveMove(uintptr_t obj, Vec3 pos, Rot rot, float scale, DWORD queuedAt) {
     if (!CheckSO(obj, "live")) return;
     const DWORD wait = GetTickCount() - queuedAt;
@@ -591,10 +607,13 @@ static void PumpJobs() {
     g_pumpTicks++; g_gameThread = GetCurrentThreadId();
     if (g_trace) TraceTick();
     if ((g_pumpTicks & 15) == 0) AutoloadTick();
-    if (InterlockedCompareExchange(&g_queueCount, 0, 0) == 0) return;
     std::function<void()> job;
-    { std::lock_guard<std::mutex> l(g_qMutex); if (!g_queue.empty()) { job = std::move(g_queue.front()); g_queue.pop_front(); InterlockedDecrement(&g_queueCount); } }
+    if (InterlockedCompareExchange(&g_queueCount, 0, 0) != 0) {
+        std::lock_guard<std::mutex> l(g_qMutex);
+        if (!g_queue.empty()) { job = std::move(g_queue.front()); g_queue.pop_front(); InterlockedDecrement(&g_queueCount); }
+    }
     if (job) RunJobGuarded(&job);
+    ApplyCameraControl();   // post-game-tick camera write wins over the controller's follow update
 }
 static uint64_t HookPump(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8) {
     const uint64_t r = g_origPump(a1, a2, a3, a4, a5, a6, a7, a8);
@@ -1109,6 +1128,7 @@ struct GimmickCapture { bool valid = false; int id = 0; DWORD when = 0; uintptr_
     uint32_t k1 = 0, k2 = 0; float pos[3] = { 0, 0, 0 }; char name[96] = { 0 };
     uint8_t frame[0x2000], bSave[0x240]; };
 static const int kGimmickRing = 32;
+static volatile LONG g_gimmickCaptureLogCount = 0;
 static GimmickCapture g_gring[kGimmickRing]; static int g_gringNext = 0, g_gringIds = 0; static std::mutex g_gringMutex;
 static volatile LONG g_gimmickReplayArmed = 0; static Vec3 g_gimmickReplayAt{}; static int g_gimmickReplayId = 0;
 void ArmGimmickReplay(Vec3 at, int id) { g_gimmickReplayAt = at; g_gimmickReplayId = id; InterlockedExchange(&g_gimmickReplayArmed, 1); Log("[gimmick] replay of capture %d armed at (%.2f %.2f %.2f): the next spawn the game makes triggers it (walk a bit, or drop an item)", id, at.x, at.y, at.z); }
@@ -1135,6 +1155,7 @@ static bool InWindow(uintptr_t v, uintptr_t base, size_t n) { return v >= base &
 static __forceinline void CaptureGimmick(void* param, void* out, void* mgr, void* owner, void* s5, void* s6, void* s7, void* s8, void* s9, void* s10, void* s11, void* s12) {
     uintptr_t ret = (uintptr_t)_ReturnAddress();
     std::lock_guard<std::mutex> l(g_gringMutex);
+    const bool report = g_trace || InterlockedIncrement(&g_gimmickCaptureLogCount) <= 4;
     GimmickCapture& c = g_gring[g_gringNext % kGimmickRing]; c.valid = false;
     c.param = (uintptr_t)param; c.mgr = mgr; c.owner = owner; c.out = out;
     c.ownerPath[0] = 0;
@@ -1146,14 +1167,14 @@ static __forceinline void CaptureGimmick(void* param, void* out, void* mgr, void
     // the frame sits near the top of the thread's stack for some callers (item drop: s8 = param+0x768): the window must not run
     // past the end of the mapped stack, so it is clamped to the region the base lies in
     { MEMORY_BASIC_INFORMATION mbi; if (VirtualQuery((void*)c.base, &mbi, sizeof(mbi)) == sizeof(mbi)) { const uintptr_t end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize; if (c.base + c.size > end) c.size = end - c.base; } }
-    if (!ReadBytes(c.base, c.frame, c.size)) { Log("[gimmick] capture skipped: frame window %p+0x%zx of caller rva 0x%llx not readable", (void*)c.base, c.size, InImage(ret) ? (unsigned long long)(ret - g_base) : 0ull); return; }
+    if (!ReadBytes(c.base, c.frame, c.size)) { if (report) Log("[gimmick] capture skipped: frame window %p+0x%zx of caller rva 0x%llx not readable", (void*)c.base, c.size, InImage(ret) ? (unsigned long long)(ret - g_base) : 0ull); return; }
     memcpy(&c.save, c.frame + (c.param - c.base) + 0x18, 8);
-    if (!c.save || !ReadBytes(c.save, c.bSave, kSaveSize)) { Log("[gimmick] capture skipped: save data %p of caller rva 0x%llx not readable", (void*)c.save, InImage(ret) ? (unsigned long long)(ret - g_base) : 0ull); return; }
-    for (void* q : { out, s5, s6, s8 }) if (q && !InWindow((uintptr_t)q, c.base, c.size)) { uintptr_t ret = (uintptr_t)_ReturnAddress(); Log("[gimmick] capture skipped: a block of caller rva 0x%llx lies far from its frame (%p vs param %p)", InImage(ret) ? (unsigned long long)(ret - g_base) : 0ull, q, param); return; }
+    if (!c.save || !ReadBytes(c.save, c.bSave, kSaveSize)) { if (report) Log("[gimmick] capture skipped: save data %p of caller rva 0x%llx not readable", (void*)c.save, InImage(ret) ? (unsigned long long)(ret - g_base) : 0ull); return; }
+    for (void* q : { out, s5, s6, s8 }) if (q && !InWindow((uintptr_t)q, c.base, c.size)) { uintptr_t ret = (uintptr_t)_ReturnAddress(); if (report) Log("[gimmick] capture skipped: a block of caller rva 0x%llx lies far from its frame (%p vs param %p)", InImage(ret) ? (unsigned long long)(ret - g_base) : 0ull, q, param); return; }
     c.caller = InImage(ret) ? ret - g_base : 0; c.when = GetTickCount(); c.id = ++g_gringIds; c.valid = true; g_gringNext++;
     const uint8_t* b8 = c.frame + ((uintptr_t)s8 - c.base); memcpy(&c.k1, b8 + 0x30, 4); memcpy(&c.k2, b8 + 0x38, 4); memcpy(c.pos, b8 + 0x1C, 12);
-    if (c.ownerPath[0]) { const char* fn = strrchr(c.ownerPath, '/'); strncpy_s(c.name, fn ? fn + 1 : c.ownerPath, _TRUNCATE); Log("[gimmick] capture %d: prefab path (r9) %s", c.id, c.ownerPath); }
-    Log("[gimmick] captured spawn %d (caller rva 0x%llx): words s8+30 = %u, s8+38 = %u, pos (%.2f %.2f %.2f)", c.id, (unsigned long long)c.caller, c.k1, c.k2, c.pos[0], c.pos[1], c.pos[2]);
+    if (c.ownerPath[0]) { const char* fn = strrchr(c.ownerPath, '/'); strncpy_s(c.name, fn ? fn + 1 : c.ownerPath, _TRUNCATE); if (report) Log("[gimmick] capture %d: prefab path (r9) %s", c.id, c.ownerPath); }
+    if (report) Log("[gimmick] captured spawn %d (caller rva 0x%llx): words s8+30 = %u, s8+38 = %u, pos (%.2f %.2f %.2f)", c.id, (unsigned long long)c.caller, c.k1, c.k2, c.pos[0], c.pos[1], c.pos[2]);
     if (g_trace) for (size_t o = 0; o + 8 <= c.size; o += 8) {   // where does the frame refer to server scene objects?
         uintptr_t v; memcpy(&v, c.frame + o, 8); if (v < 0x10000 || (v >> 47)) continue;
         const char* n = RttiName(v); if (!n || !strstr(n, "SceneObjectServer")) continue;
@@ -1416,7 +1437,11 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
     { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); if (g_gimmickQueue.empty()) return; r = g_gimmickQueue.front(); pending = g_gimmickQueue.size(); }
     GimmickCapture t;
     if (!FindTemplateCapture(t)) { static DWORD lastLog = 0; if (GetTickCount() - lastLog > 15000) { lastLog = GetTickCount(); Log("[gimmick] %zu interactive object%s waiting for a spawn template (the game spawns one when you walk)", pending, pending == 1 ? "" : "s"); } return; }
-    { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.pop_front(); }
+    {   // A render-thread move can cancel this uid while template lookup is running. Never pop the next batch member.
+        std::lock_guard<std::mutex> l(g_gimmickQueueMutex);
+        if (g_gimmickQueue.empty() || g_gimmickQueue.front().uid != r.uid) return;
+        g_gimmickQueue.pop_front();
+    }
     { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid); if (i < 0 || g_reg[(size_t)i].hidden || g_reg[(size_t)i].standin) return; }   // deleted or being dragged meanwhile
     char saved[256]; memcpy(saved, g_replayPrefab, sizeof saved); strncpy_s(g_replayPrefab, r.prefab.c_str(), _TRUNCATE);
     float xf[12]; MakeTransform(xf, r.pos, r.rot, r.scale, false); memcpy(g_replayQuat, xf + 3, 16); g_replayScale = r.scale; g_replayUseRot = true;
@@ -1436,10 +1461,18 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
     }
 }
 static void* __fastcall HookGimmickSpawn(void* param, void* out, void* mgr, void* owner, void* s5, void* s6, void* s7, void* s8, void* s9, void* s10, void* s11, void* s12) {
+    // When interactive gimmick placement is disabled, leave ordinary game spawns untouched. Capturing stack/save blocks on every
+    // native spawn is only needed for that optional editor feature or an explicit trace/replay session.
+    if (!g_gimmickSpawn && !g_trace && !g_traceHooks && !g_gimmickReplayArmed)
+        return g_origGimmickSpawn(param, out, mgr, owner, s5, s6, s7, s8, s9, s10, s11, s12);
     g_spawnWindowThread = GetCurrentThreadId(); g_spawnWindowTick = GetTickCount();
     CaptureGimmick(param, out, mgr, owner, s5, s6, s7, s8, s9, s10, s11, s12);
     if (!g_trace) {
+        const DWORD started = GetTickCount();
         void* r0 = g_origGimmickSpawn(param, out, mgr, owner, s5, s6, s7, s8, s9, s10, s11, s12);
+        static volatile LONG s_nativeSpawnLogged = 0;
+        const LONG n = InterlockedIncrement(&s_nativeSpawnLogged);
+        if (n <= 4) Log("[gimmick] native spawn call %ld returned %p after %lu ms", n, r0, GetTickCount() - started);
         if (InterlockedCompareExchange(&g_gimmickReplayArmed, 0, 1) == 1) ReplayGimmick();
         return r0;
     }
@@ -1502,13 +1535,12 @@ static void FindStringsForHash(uint32_t code) {
 // The field's create ends in one function that validates the "info object" of the spawn (it must carry a scene object UUID at
 // +0x1D8, else eErrNoInvalidSceneObjectUUID) and creates the actor. Its wrapper takes that object as the first stack argument.
 // Hooked for logging only: which object it is (RTTI), its UUID, and the flags, for the game's own spawns and for the replay.
-static uintptr_t kRva_ActorCreateCore = 0; static int g_coreLogged = 0;
+static uintptr_t kRva_ActorCreateCore = 0;
 using ActorCoreFn = void* (__fastcall*)(void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7, void* a8, void* a9, void* a10, void* a11, void* a12);
 static ActorCoreFn g_origActorCore = nullptr;
 static void* __fastcall HookActorCore(void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7, void* a8, void* a9, void* a10, void* a11, void* a12) {
-    const bool log = g_trace || g_inGimmickReplay || g_coreLogged < 3;
+    const bool log = g_trace || (g_traceHooks && g_inGimmickReplay);
     if (log) {
-        g_coreLogged++;
         uintptr_t payload = 0; if (a5) ReadBytes((uintptr_t)a5, &payload, 8);
         uint32_t uuid[4] = { 0, 0, 0, 0 }; if (payload) ReadBytes(payload + 0x1D8, uuid, 16);
         const char* n1 = payload ? RttiName(payload) : nullptr; const char* n2 = payload ? RttiName(payload - 0x28) : nullptr;
@@ -1985,10 +2017,104 @@ static uintptr_t CameraManagerPtr() {
     for (auto& f : found) if (f.first.find("CameraManager@") != std::string::npos) { g_camMgr = f.second; Log("camera manager %p", (void*)g_camMgr); break; }
     return g_camMgr;
 }
+static uintptr_t CameraSceneObject() {
+    uintptr_t so = Deref(CameraManagerPtr(), 0x40);
+    const char* n = so ? RttiName(so) : nullptr;
+    return n && strstr(n, "SceneObject") ? so : 0;
+}
+static bool CameraControlTransform(uintptr_t object, float* out) {
+    std::lock_guard<std::mutex> l(g_cameraControlMutex);
+    if (!g_cameraControl.active || g_cameraControl.object != object) return false;
+    MakeTransform(out, g_cameraControl.pos, { g_cameraControl.yaw, g_cameraControl.pitch, g_cameraControl.roll }, g_cameraControl.original[0], true);
+    return true;
+}
+static void ApplyCameraControl() {
+    CameraControlState state;
+    { std::lock_guard<std::mutex> l(g_cameraControlMutex); if (!g_cameraControl.active) return; state = g_cameraControl; }
+    if (!g_origSetXf || !CheckSO(state.object, "camera control")) return;
+    alignas(16) float transform[12];
+    MakeTransform(transform, state.pos, { state.yaw, state.pitch, state.roll }, state.original[0], true);
+    g_origSetXf((void*)state.object, transform, 0, 1);
+}
+void CameraControlStart() {
+    if (!g_origSetXf || !GameThreadReady()) { Log("camera control: game transform hook or game thread is not ready"); return; }
+    RunOnGameThread([]() {
+        { std::lock_guard<std::mutex> l(g_cameraControlMutex); if (g_cameraControl.active) return; }
+        const uintptr_t so = CameraSceneObject();
+        float original[11] = {};
+        if (!so || !ReadBytes(so + 0x1A4, original, 40) || !ReadBytes(so + 0x1CC, original + 10, 4)) {
+            Log("camera control: active camera transform is unavailable"); return;
+        }
+        const float qx = original[3], qy = original[4], qz = original[5], qw = original[6];
+        const float qlen = qx * qx + qy * qy + qz * qz + qw * qw;
+        if (!std::isfinite(qlen) || fabsf(qlen - 1.0f) > 0.1f || !std::isfinite(original[7] + original[8] + original[9])) {
+            Log("camera control: active camera transform failed validation"); return;
+        }
+        int16_t tile[2]; memcpy(tile, original + 10, sizeof tile);
+        CameraControlState state;
+        state.active = true; state.object = so;
+        memcpy(state.original, original, sizeof original);
+        state.pos = { original[7] + tile[0] * kTileSize, original[8], original[9] + tile[1] * kTileSize };
+        // MakeTransform builds Ry(yaw) * Rx(pitch) * Rz(roll). Extract yaw from the rotated +Z
+        // axis (R02/R22); the common ZYX denominator is wrong here when the camera is pitched.
+        state.yaw = atan2f(2.0f * (qx * qz + qy * qw), 1.0f - 2.0f * (qx * qx + qy * qy)) * (180.0f / 3.14159265f);
+        state.pitch = asinf(std::max(-1.0f, std::min(1.0f, -2.0f * (qy * qz - qx * qw)))) * (180.0f / 3.14159265f);
+        state.pitch = std::max(-85.0f, std::min(85.0f, state.pitch));
+        state.roll = atan2f(2.0f * (qx * qy + qz * qw), 1.0f - 2.0f * (qx * qx + qz * qz)) * (180.0f / 3.14159265f);
+        { std::lock_guard<std::mutex> l(g_cameraControlMutex); g_cameraControl = state; }
+        Log("camera control: captured camera %p at (%.1f %.1f %.1f)", (void*)so, state.pos.x, state.pos.y, state.pos.z);
+    });
+}
+void CameraControlStop() {
+    if (!g_origSetXf) return;
+    RunOnGameThread([]() {
+        CameraControlState state;
+        { std::lock_guard<std::mutex> l(g_cameraControlMutex); if (!g_cameraControl.active) return; state = g_cameraControl; }
+        alignas(16) float original[12] = {};
+        memcpy(original, state.original, sizeof state.original);
+        if (CheckSO(state.object, "camera restore")) g_origSetXf((void*)state.object, original, 0, 1);
+        { std::lock_guard<std::mutex> l(g_cameraControlMutex); if (g_cameraControl.object == state.object) g_cameraControl = {}; }
+        Log("camera control: restored camera %p", (void*)state.object);
+    });
+}
+bool CameraControlActive() { std::lock_guard<std::mutex> l(g_cameraControlMutex); return g_cameraControl.active; }
+void CameraControlStep(float forward, float right, float up, float yaw, float pitch, float zoom, float dt, bool fast) {
+    if (!std::isfinite(dt) || dt <= 0) return;
+    dt = std::min(dt, 0.1f);
+    std::lock_guard<std::mutex> l(g_cameraControlMutex);
+    if (!g_cameraControl.active) return;
+    const float speed = (fast ? 32.0f : 8.0f) * dt;
+    const float ry = g_cameraControl.yaw * (3.14159265f / 180.0f), rp = g_cameraControl.pitch * (3.14159265f / 180.0f);
+    const Vec3 fwd = { sinf(ry) * cosf(rp), -sinf(rp), cosf(ry) * cosf(rp) };
+    const Vec3 side = { cosf(ry), 0, -sinf(ry) };
+    g_cameraControl.pos.x += (fwd.x * forward + side.x * right) * speed;
+    g_cameraControl.pos.y += (fwd.y * forward + up) * speed;
+    g_cameraControl.pos.z += (fwd.z * forward + side.z * right) * speed;
+    g_cameraControl.pos.x += fwd.x * zoom * 3.0f;
+    g_cameraControl.pos.y += fwd.y * zoom * 3.0f;
+    g_cameraControl.pos.z += fwd.z * zoom * 3.0f;
+    const float turn = 100.0f * dt;
+    g_cameraControl.yaw += yaw * turn;
+    g_cameraControl.yaw = fmodf(g_cameraControl.yaw + 180.0f, 360.0f);
+    if (g_cameraControl.yaw < 0) g_cameraControl.yaw += 360.0f;
+    g_cameraControl.yaw -= 180.0f;
+    g_cameraControl.pitch = std::max(-85.0f, std::min(85.0f, g_cameraControl.pitch + pitch * turn));
+    g_cameraControl.pos.x = std::max(-32000000.0f, std::min(32000000.0f, g_cameraControl.pos.x));
+    g_cameraControl.pos.y = std::max(-1000000.0f, std::min(1000000.0f, g_cameraControl.pos.y));
+    g_cameraControl.pos.z = std::max(-32000000.0f, std::min(32000000.0f, g_cameraControl.pos.z));
+}
+void CameraControlLook(float dx, float dy) {
+    if (!std::isfinite(dx) || !std::isfinite(dy)) return;
+    std::lock_guard<std::mutex> l(g_cameraControlMutex);
+    if (!g_cameraControl.active) return;
+    g_cameraControl.yaw += dx * 0.12f;
+    g_cameraControl.yaw = fmodf(g_cameraControl.yaw + 180.0f, 360.0f);
+    if (g_cameraControl.yaw < 0) g_cameraControl.yaw += 360.0f;
+    g_cameraControl.yaw -= 180.0f;
+    g_cameraControl.pitch = std::max(-85.0f, std::min(85.0f, g_cameraControl.pitch + dy * 0.12f));
+}
 bool CameraBasis(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd) {
-    uintptr_t mgr = CameraManagerPtr(); if (!mgr) return false;
-    uintptr_t so = Deref(mgr, 0x40); if (!so) return false;
-    const char* n = RttiName(so); if (!n || !strstr(n, "SceneObject")) return false;
+    uintptr_t so = CameraSceneObject(); if (!so) return false;
     float xf[10]; int16_t tile[2];
     if (!ReadBytes(so + 0x1A4, xf, 40) || !ReadBytes(so + 0x1CC, tile, 4)) return false;
     const float x = xf[3], y = xf[4], z = xf[5], w = xf[6];
@@ -2012,9 +2138,7 @@ bool CameraFov(float* deg) {
     return false;
 }
 bool CameraPose(Vec3* fwd, Vec3* pos) {
-    uintptr_t mgr = CameraManagerPtr(); if (!mgr) return false;
-    uintptr_t so = Deref(mgr, 0x40); if (!so) return false;
-    const char* n = RttiName(so); if (!n || !strstr(n, "SceneObject")) return false;
+    uintptr_t so = CameraSceneObject(); if (!so) return false;
     float xf[10]; int16_t tile[2];
     if (!ReadBytes(so + 0x1A4, xf, 40) || !ReadBytes(so + 0x1CC, tile, 4)) return false;   // world TiledTransform: scale3, quat4, pos3, tile
     const float x = xf[3], y = xf[4], z = xf[5], w = xf[6];
@@ -2082,7 +2206,7 @@ static void LoadSettings() {
         else if (k.rfind("key_", 0) == 0) { for (int i = 0; i < PK_COUNT; i++) if (k == std::string("key_") + kPlaceKeyIds[i]) g_placeKeys[i] = vk; }
     }
     ApplyPlaceKeys();
-    Log("settings: toggle %s, mode %s, console %s", KeyName(g_keyToggle), KeyName(g_keyMode), g_showConsole ? "on" : "off");
+    Log("settings: toggle %s, mode %s, console %s, interactive gimmick spawning %s, research hooks %s", KeyName(g_keyToggle), KeyName(g_keyMode), g_showConsole ? "on" : "off", g_gimmickSpawn ? "on" : "off", g_traceHooks ? "on" : "off");
 }
 void SaveSettings() {
     FILE* f = fopen(SettingsPath().c_str(), "w"); if (!f) return;
@@ -2137,7 +2261,7 @@ static DWORD WINAPI ConsoleThread(LPVOID) {
         }
         else if (cmd.rfind("move ", 0) == 0) { int i = 0; float x, y, z, yaw = 0, sc = 1; if (sscanf(cmd.c_str() + 5, "%d %f %f %f %f %f", &i, &x, &y, &z, &yaw, &sc) >= 4) Log("move #%d -> %s", i, MoveSpawned(i, { x, y, z }, Rot{ yaw }, sc) ? "queued" : "failed"); else Log("usage: move <idx> x y z [yaw] [scale]"); }
         else if (cmd.rfind("hide ", 0) == 0) { int i = atoi(cmd.c_str() + 5); Log("hide #%d -> %s", i, HideSpawned(i) ? "ok" : "failed"); }
-        else if (cmd.rfind("livemode ", 0) == 0) { g_liveMode = atoi(cmd.c_str() + 9); Log("livemode = %d", g_liveMode); }
+        else if (cmd.rfind("livemode ", 0) == 0) { g_liveMode = std::max(0, std::min(3, atoi(cmd.c_str() + 9))); Log("livemode = %d", g_liveMode); }
         else if (cmd == "trace on" || cmd == "trace off") SetTrace(cmd == "trace on");
         else if (cmd.rfind("tp ", 0) == 0) { Vec3 w{}; if (sscanf(cmd.c_str() + 3, "%f %f %f", &w.x, &w.y, &w.z) == 3) SetPlayerPos(w); else Log("usage: tp x y z"); }
         else if (cmd == "camtrace") CamTrace(16);
@@ -2197,9 +2321,11 @@ static void ReleaseHookPiece() {   // one piece per hook creation; MinHook takes
 }
 static void ReleaseHookGap() { ReleaseHookPiece(); }
 static DWORD WINAPI InitThread(LPVOID) {
-    if (MH_Initialize() != MH_OK) { Log("MinHook init failed"); return 0; }
-    InstallIoTrace();
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);   // win the race to install the overlay before startup creates its swapchain
+    if (MH_Initialize() != MH_OK) { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL); Log("MinHook init failed"); return 0; }
     overlay::Install();          // first: must be in place before the game creates its swapchain
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+    InstallIoTrace();
     LoadPrefabs();
     if (g_httpEnabled) httpapi::Start(g_httpPort);   // opt-in; before ResolveGame on purpose: /api/status reports a failed build, writes answer 503
     thumbgen::Start();           // background: renders prefab previews from the pack files into bin64\cdmodkit\thumbs
@@ -2230,7 +2356,7 @@ static DWORD WINAPI InitThread(LPVOID) {
         if (kRva_ActorCtor) { void* t13 = (void*)(g_base + kRva_ActorCtor); HookFn(t13, (void*)HookActorCtor, (void**)&g_origActorCtor, "actor constructor (trace)"); }
         if (g_traceHooks && kRva_RemovalLoop) { void* t12 = (void*)(g_base + kRva_RemovalLoop); HookFn(t12, (void*)HookRemovalLoop, (void**)&g_origRemovalLoop, "actor removal loop (trace)"); }
         if (kRva_ActorCreateInner) { void* t11 = (void*)(g_base + kRva_ActorCreateInner); HookFn(t11, (void*)HookActorInner, (void**)&g_origActorInner, "actor create inner (trace)"); }
-        if (kRva_ActorCreateCore) { void* t8 = (void*)(g_base + kRva_ActorCreateCore); HookFn(t8, (void*)HookActorCore, (void**)&g_origActorCore, "actor create core (trace)"); }
+        if (g_traceHooks && kRva_ActorCreateCore) { void* t8 = (void*)(g_base + kRva_ActorCreateCore); HookFn(t8, (void*)HookActorCore, (void**)&g_origActorCore, "actor create core (trace)"); }
         if (kRva_GimmickSpawn) { void* t7 = (void*)(g_base + kRva_GimmickSpawn); HookFn(t7, (void*)HookGimmickSpawn, (void**)&g_origGimmickSpawn, "gimmick spawn (trace)"); }
         if (kRva_WorldCastRay) { void* t4 = (void*)(g_base + kRva_WorldCastRay); if (HookFn(t4, (void*)HookWorldCastRay, (void**)&g_origWorldCastRay, "worldCastRay (trace)")) Log("resolved worldCastRay        rva 0x%llx", (unsigned long long)kRva_WorldCastRay); }
     }
@@ -2455,7 +2581,7 @@ static void Attach(HMODULE h) {
     CreateDirectoryA(g_modDir.c_str(), nullptr);
     g_log = fopen((g_modDir + "\\cdmodkit.log").c_str(), "a");
     ReadGameVersion();
-    Log("cdmodkit.asi v0.86 attached, base=%p, game build %s", (void*)g_base, g_gameVersion.empty() ? "unknown" : g_gameVersion.c_str());
+    Log("cdmodkit.asi v0.87 attached, pid=%lu base=%p, game build %s", GetCurrentProcessId(), (void*)g_base, g_gameVersion.empty() ? "unknown" : g_gameVersion.c_str());
     LoadSettings();
     ReserveHookGap();            // before the game fills the address space around its image (see ReserveHookGap)
     CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
