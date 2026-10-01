@@ -188,12 +188,12 @@ namespace editor {
     static bool  g_favOnly = false; static bool g_meshOnly = true;
     enum MainTabId {
         TabBrowser = 0, TabScene = 1, TabProject = 2, TabTravel = 3, TabSettings = 4,
-        TabLog = 5, TabHistory = 6, TabNpcs = 7, TabEnvironment = 8, TabTerrain = 9, TabBlueprint = 10
+        TabLog = 5, TabHistory = 6, TabNpcs = 7, TabEnvironment = 8, TabTerrain = 9, TabBlueprint = 10, TabWorld = 11
     };
     static bool  g_compact = false; static int g_dockCols = 2;   // narrow dock window; supported pages reuse the full editor functions
     static int g_mainTab = TabBrowser, g_compactPage = TabBrowser; static bool g_selectMainTab = false;
     static bool SharedPage(int page) {
-        return page == TabBrowser || page == TabScene || page == TabNpcs || page == TabProject || page == TabBlueprint ||
+        return page == TabBrowser || page == TabScene || page == TabNpcs || page == TabWorld || page == TabProject || page == TabBlueprint ||
                page == TabEnvironment || (page == TabTravel && core::TravelAvailable()) ||
                (page == TabTerrain && core::TerrainAvailable());
     }
@@ -208,9 +208,10 @@ namespace editor {
     static bool  g_showSpawnOpts = false, g_showMass = false; static int g_hoverUid = 0, g_hoverNpcUid = 0;
     static bool  g_cardView = false; static float g_cardSize = 96.0f;   // browser: tile view instead of the list (same matches / filters)
     static int   g_browserDragPrefab = -1;   // browser row/card being dragged out into the game view
-    struct BrowserDropJob { int prefab = -1, ticket = 0; DWORD queuedAt = 0; Vec3 center{}; float yaw = 0, scale = 1, probeTop = 0; int retry = 0; };
+    struct BrowserDropJob { int prefab = -1, ticket = 0; DWORD queuedAt = 0; Vec3 center{}; Rot rot{}; float scale = 1, probeTop = 0; int retry = 0; };
     static std::vector<BrowserDropJob> g_browserDropJobs;   // ground is probed before spawning, so a new object's own collision cannot be mistaken for the surface
     static int   g_npcDragIndex = -1;        // character row/card being dragged out into the game view
+    static int   g_sceneDragKey = 0;         // positive object UID or negative managed NPC UID; source remains in the scene
     struct NpcDropJob { uint32_t key = 0; int ticket = 0; DWORD queuedAt = 0; Vec3 at{}; int count = 1, formation = 1; float spacing = 1.5f, radius = 8.0f, fx = 0, fz = 1; bool ai = true; int behavior = 0;
         float probeTop = 0; int retry = 0; bool centerResolved = false; std::vector<Vec3> positions; std::vector<int> memberTickets; std::vector<uint8_t> memberRetries; };
     static std::vector<NpcDropJob> g_npcDropJobs;
@@ -238,6 +239,9 @@ namespace editor {
     static bool g_boxSelecting = false, g_boxMoved = false, g_boxAdd = false; static ImVec2 g_boxStart{}, g_boxCurrent{}; static std::set<int> g_boxBase, g_boxNpcBase;
     static bool g_rightGesture = false, g_rightMoved = false, g_worldPopupRequested = false, g_worldPopupOpen = false; static ImVec2 g_rightStart{}, g_worldPopupPos{}; static int g_rightUid = 0;
     static bool  g_selectGroups = true, g_showDeleted = false;
+    static bool g_nativeWorldPick = false; static uintptr_t g_nativeWorldSelected = 0, g_nativeWorldHover = 0, g_rightNative = 0;
+    static float g_nativeEditPos[3] = {}, g_nativeEditRot[3] = {}, g_nativeEditScale = 1.0f;
+    static uintptr_t g_nativeEditHandle = 0;
     static float g_edit[3] = { 0, 0, 0 }, g_editScale = 1; static Rot g_editRot, g_editRot0; static Vec3 g_editPos0{}; static float g_editScale0 = 1;
     static int   g_editUid = 0; static bool g_live = true;
     static std::vector<std::string> g_log;
@@ -431,6 +435,7 @@ namespace editor {
         g_rightGesture = g_rightMoved = g_worldPopupRequested = false; g_rightUid = 0;
         g_browserDragPrefab = -1; g_browserDropJobs.clear();
         g_npcDragIndex = -1; g_npcDropJobs.clear();
+        g_sceneDragKey = 0;
         ImGui::GetIO().ClearInputKeys();
         if (g_previewShown) { core::PreviewClear(); g_previewShown = false; }
     }
@@ -1338,8 +1343,8 @@ namespace editor {
         return top > -1e29f ? top : 2.0f;
     }
     // One cast from startY straight down. Returns 1 = ground found (groundY set), 0 = cast again from the updated startY,
-    // -1 = give up. The object's own collision is in the way: hits inside its vertical range are stepped through (a cast that
-    // starts inside a body reports fraction 0, so the start is lowered in 0.5 m steps until it leaves the body).
+    // -1 = give up. The object's own collision is in the way: hits inside its vertical range are stepped through.
+    // Penetrating casts are reported as misses by the probe, so they cannot become a surface high above the cast.
     static int GroundStep(const core::GroundHit& gh, float x, float z, float bottom, float top, float& startY, int& iter, float* groundY) {
         const float cy = gh.centerY - gh.radius;
         core::Log("[ground] cast from y %.2f: %s fraction %.4f center %.2f (object %.2f..%.2f)", startY, gh.hit ? "hit" : "no hit", gh.fraction, gh.centerY, bottom, top);
@@ -1348,7 +1353,7 @@ namespace editor {
             if (iter == 1) { startY = top + 150.0f; return 0; }
             return -1;
         }
-        const bool inside = gh.fraction <= 0.0005f;   // the sphere started inside a body (Havok reports a negative fraction)
+        const bool inside = gh.fraction <= 0.0005f;   // a zero fraction can mean that the sphere started touching a body
         if (iter == 1 && inside) { startY = top + 150.0f; return 0; }   // buried: something solid sits above the top, so the surface is found from far above
         if (startY > bottom - 0.1f) {                                    // still beside the object: hits here are the object itself (a 36 m tower needs one jump, not 0.5 m steps)
             if (inside || (cy > bottom + 0.03f && cy < top + 0.03f)) { startY = bottom - 0.1f; return 0; }
@@ -2217,6 +2222,25 @@ namespace editor {
     // request so they can be selected, moved in-place through TransformSync when safe (respawn fallback), deleted,
     // AI-controlled and persisted in .cdproj files.
     static char g_npcFilter[128] = ""; static int g_npcCat = 0, g_npcSel = -1, g_npcCount = 1; static float g_npcDist = 5.0f;
+    static std::set<uint32_t> g_npcFavorites; static bool g_npcFavoritesLoaded = false, g_npcFavOnly = false; static std::string g_npcKey;
+    static void LoadNpcFavorites() {
+        if (g_npcFavoritesLoaded) return;
+        g_npcFavoritesLoaded = true;
+        FILE* f = fopen((core::ModDir() + "\\npc_favorites.txt").c_str(), "r"); if (!f) return;
+        unsigned key = 0; while (fscanf(f, "%u", &key) == 1) if (key) g_npcFavorites.insert(key);
+        fclose(f);
+    }
+    static void ToggleNpcFavorite(uint32_t key) {
+        LoadNpcFavorites();
+        if (!g_npcFavorites.erase(key)) g_npcFavorites.insert(key);
+        FILE* f = fopen((core::ModDir() + "\\npc_favorites.txt").c_str(), "w");
+        if (f) { for (uint32_t id : g_npcFavorites) fprintf(f, "%u\n", id); fclose(f); }
+        g_npcKey.clear();
+    }
+    static void NpcFavoriteMenu(uint32_t key) {
+        LoadNpcFavorites();
+        if (ImGui::MenuItem(T(g_npcFavorites.count(key) ? "remove favorite" : "add favorite"))) ToggleNpcFavorite(key);
+    }
     static int g_npcFormation = 1; static float g_npcSpacing = 1.5f, g_npcRadius = 8.0f;
     static bool g_npcSpawnAi = true; static int g_npcSpawnBehavior = 0;
     static int g_npcNoteEditUid = 0, g_npcLabelEditUid = 0, g_groupNameEditId = 0, g_objectNoteEditUid = 0;
@@ -2226,7 +2250,7 @@ namespace editor {
     // NPCs only live where the world is streamed in around the character, and every one is a full server actor: a few hundred
     // within a few hundred metres is what the game copes with (the server jobs are spread over ticks, see ProcessServerJobs).
     static const int kNpcMaxCount = 500; static const float kNpcMaxDist = 500.0f, kNpcMaxExtent = 200.0f;
-    static std::vector<int> g_npcRows; static std::string g_npcKey;
+    static std::vector<int> g_npcRows;
     static const char* kNpcCats[] = { "all", "people", "animals and mounts", "monsters", "bosses", "other" };
     static const char* kNpcFormations[] = { "Line", "Matrix", "Circle" };
     static const char* kNpcBehaviors[] = { "Normal autonomous", "Hold position (AI paused)" };
@@ -2269,14 +2293,14 @@ namespace editor {
     }
     static void SpawnNpcFormationGrounded(uint32_t key, Vec3 center, int count, int formation, float spacing, float radius, float fx, float fz, bool ai, int behavior) {
         if (!core::GroundProbeReady()) {
-            g_npcDropJobs.push_back({ key, 0, GetTickCount(), center, count, formation, spacing, radius, fx, fz, ai, behavior });
+            Note("Ground probe unavailable; NPC was not placed");
             return;
         }
         const CamFrame cf = CurrentCam();
         const float startY = std::max(center.y, cf.ok ? cf.pos.y : center.y) + 150.0f;
         const int ticket = core::GroundProbe({ center.x, startY, center.z }, 500.0f);
         if (!ticket) {
-            g_npcDropJobs.push_back({ key, 0, GetTickCount(), center, count, formation, spacing, radius, fx, fz, ai, behavior });
+            Note("Ground probe unavailable; NPC was not placed");
             return;
         }
         g_npcDropJobs.push_back({ key, ticket, GetTickCount(), center, count, formation, spacing, radius, fx, fz, ai, behavior });
@@ -2546,6 +2570,7 @@ namespace editor {
                 if (ImGui::IsItemClicked(0)) g_npcSel = i;
                 if (hov && ImGui::IsMouseDoubleClicked(0) && canSpawn) { g_npcSel = i; SpawnNpcInFront(c); }
                 if (canDrag && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 6.0f)) g_npcDragIndex = i;
+                if (ImGui::BeginPopupContextItem("npc-favorite")) { NpcFavoriteMenu(c.key); ImGui::EndPopup(); }
                 dl->AddRectFilled(p0, p1, sel ? ImGui::GetColorU32(ImGuiCol_Header) : hov ? ImGui::GetColorU32(ImGuiCol_FrameBgHovered) : ImGui::GetColorU32(ImGuiCol_FrameBg), 4.0f);
                 if (sel) dl->AddRect(p0, p1, ImGui::GetColorU32(ImGuiCol_HeaderActive), 4.0f, 0, 2.0f);
                 ImTextureID tex = c.app.empty() ? ImTextureID{} : overlay::Thumb(core::ThumbFile(c.app));
@@ -2640,6 +2665,7 @@ namespace editor {
                 if (EditableProject(n.proj) && ImGui::BeginPopupContextItem("npcctx")) {
                     if (!g_managedNpcSel.count(n.uid)) SelectManagedNpc(n.uid, false);
                     if (!n.note.empty()) { ImGui::TextDisabled("%s", n.note.c_str()); ImGui::Separator(); }
+                    NpcFavoriteMenu(n.key);
                     ImGui::BeginDisabled(!core::TravelAvailable());
                     if (ImGui::MenuItem(T("Travel here"))) TravelGo(ManagedNpcDisplayPos(n), ManagedNpcHistoryName(n).c_str());
                     ImGui::EndDisabled();
@@ -2719,6 +2745,7 @@ namespace editor {
         ImGui::Separator();
     }
     static void DrawNpcs(const PosInfo& p, bool havePos, bool compact = false) {
+        LoadNpcFavorites();
         const auto chars = thumbgen::Characters();
         const float ui = ImGui::GetFontSize() / 17.0f;
         const int st = core::NpcState();
@@ -2752,7 +2779,8 @@ namespace editor {
             ImGui::SetNextItemWidth(180.0f * ui);
             ComboT("##npccat", &g_npcCat, kNpcCats, 6);
         }
-        const std::string key = std::string(g_npcFilter) + "|" + std::to_string(g_npcCat) + "|" + std::to_string((uintptr_t)chars.get());
+        SameLineForControl(ICON_STAR " favorites", true); if (ImGui::Checkbox(T(ICON_STAR " favorites"), &g_npcFavOnly)) g_npcKey.clear();
+        const std::string key = std::string(g_npcFilter) + "|" + std::to_string(g_npcCat) + "|" + std::to_string(g_npcFavOnly) + "|" + std::to_string((uintptr_t)chars.get());
         if (key != g_npcKey) {
             const int oldSel = g_npcSel;
             g_npcKey = key; g_npcRows.clear();
@@ -2760,6 +2788,7 @@ namespace editor {
             for (int i = 0; i < (int)chars->size(); i++) {
                 const auto& c = (*chars)[i];
                 if (g_npcCat && NpcCategory(c.internal) != g_npcCat) continue;
+                if (g_npcFavOnly && !g_npcFavorites.count(c.key)) continue;
                 const std::string hay = c.name + " " + c.internal + " " + std::to_string(c.key); bool ok = true;
                 for (const auto& w : words) if (!ContainsCI(hay, w)) { ok = false; break; }
                 if (ok) g_npcRows.push_back(i);
@@ -2790,6 +2819,7 @@ namespace editor {
                     if (ImGui::IsMouseDoubleClicked(0) && havePos && st == 2) SpawnNpcInFront(c);
                 }
                 if (st == 2 && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 6.0f)) g_npcDragIndex = i;
+                if (ImGui::BeginPopupContextItem("npc-favorite")) { NpcFavoriteMenu(c.key); ImGui::EndPopup(); }
                 ImGui::TableSetColumnIndex(1); ImGui::TextDisabled("%s", c.internal.c_str());
                 ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%u", c.key);
                 ImGui::PopID();
@@ -3197,10 +3227,9 @@ namespace editor {
     }
     static void PaintTerrainTileThumbnail(const SceneTerrainTile& tile, ImVec2 min, ImVec2 max, ImDrawList* dl) {
         const ImVec2 size(max.x - min.x, max.y - min.y);
-        dl->AddRectFilled(min, max, IM_COL32(27, 36, 43, 255), 4.0f);
         dl->PushClipRect(min, max, true);
-        constexpr int dim = 32;
-        struct Preview { int generation = -1; DWORD attempted = 0; bool ready = false; std::vector<float> delta; float peak = 0; };
+        constexpr int dim = 20;
+        struct Preview { int generation = -1; DWORD attempted = 0; bool ready = false; std::vector<float> delta, heights; float peak = 0; };
         static std::map<std::tuple<int, int, int>, Preview> previews;
         if (previews.size() > 256) previews.clear();
         Preview& preview = previews[{ tile.tx, tile.tz, tile.project }];
@@ -3208,20 +3237,30 @@ namespace editor {
         if (preview.generation != generation || (!preview.ready && GetTickCount() - preview.attempted >= 1000)) {
             preview.generation = generation;
             preview.attempted = GetTickCount();
-            preview.ready = core::TerrainTilePreview(tile.tx, tile.tz, tile.project, dim, &preview.delta);
+            preview.ready = core::TerrainTilePreview(tile.tx, tile.tz, tile.project, dim, &preview.delta, &preview.heights);
             preview.peak = 0;
             if (preview.ready) for (float value : preview.delta) preview.peak = std::max(preview.peak, std::fabs(value));
         }
-        if (preview.ready) {
-            for (int y = 0; y < dim; ++y) for (int x = 0; x < dim; ++x) {
-                const float value = preview.delta[(size_t)y * dim + x];
-                if (std::fabs(value) < 0.01f) continue;
-                const float strength = preview.peak > 0 ? std::min(1.0f, std::fabs(value) / preview.peak) : 0;
-                const int alpha = (int)(75 + 180 * strength);
-                const ImU32 color = value > 0 ? IM_COL32(255, 177, 91, alpha) : IM_COL32(91, 175, 255, alpha);
-                const ImVec2 a(min.x + size.x * x / dim, min.y + size.y * y / dim);
-                const ImVec2 b(min.x + size.x * (x + 1) / dim, min.y + size.y * (y + 1) / dim);
-                dl->AddRectFilled(a, b, color);
+        if (preview.ready && preview.heights.size() == (size_t)dim * dim) {
+            const auto range = std::minmax_element(preview.heights.begin(), preview.heights.end());
+            const float heightRange = std::max(1.0f, *range.second - *range.first);
+            const float unit = std::min(size.x / (2.0f * dim), size.y / (1.6f * dim));
+            const float rise = std::min(size.y * 0.30f, heightRange * unit * 0.75f);
+            auto point = [&](int x, int y) {
+                const float h = preview.heights[(size_t)y * dim + x];
+                return ImVec2(min.x + size.x * 0.5f + (x - y) * unit,
+                    min.y + size.y * 0.24f + (x + y) * unit * 0.48f - (h - *range.first) / heightRange * rise);
+            };
+            // Painter's order keeps the far slope behind the near slope; the tile card supplies its only frame.
+            for (int sum = 0; sum < 2 * (dim - 1) - 1; ++sum) for (int y = 0; y < dim - 1; ++y) {
+                const int x = sum - y; if (x < 0 || x >= dim - 1) continue;
+                const ImVec2 a = point(x, y), b = point(x + 1, y), c = point(x + 1, y + 1), d = point(x, y + 1);
+                const float change = preview.delta[(size_t)y * dim + x];
+                const float strength = preview.peak > 0 ? std::min(1.0f, std::fabs(change) / preview.peak) : 0;
+                const int light = std::clamp((int)(105 + 50 * (preview.heights[(size_t)y * dim + x] - *range.first) / heightRange), 0, 255);
+                const ImU32 color = change > 0.01f ? IM_COL32(185 + (int)(55 * strength), 130 + (int)(45 * strength), 79, 255) :
+                    change < -0.01f ? IM_COL32(116, 142, 116 + (int)(25 * strength), 255) : IM_COL32(light, std::min(255, light + 21), std::max(0, light - 34), 255);
+                dl->AddQuadFilled(a, b, c, d, color);
             }
         } else {
             // Unloaded tiles have no sampled heights yet. Show the saved stroke footprint until the tile streams in.
@@ -3232,11 +3271,11 @@ namespace editor {
                 const float v = std::clamp((stroke.z - tile.tz * 1024.0f) / 1024.0f, 0.0f, 1.0f);
                 const float radius = std::max(2.5f, stroke.r * size.x / 1024.0f);
                 const ImU32 color = stroke.mode == core::TerrainFlatten ? IM_COL32(115, 210, 145, 175) :
-                    stroke.amount >= 0 ? IM_COL32(255, 177, 91, 175) : IM_COL32(91, 175, 255, 175);
-                dl->AddCircleFilled(ImVec2(min.x + u * size.x, max.y - v * size.y), radius, color, 12);
+                    stroke.amount >= 0 ? IM_COL32(255, 177, 91, 175) : IM_COL32(130, 168, 122, 175);
+                dl->AddCircleFilled(ImVec2(min.x + size.x * 0.5f + (u - v) * size.x * 0.44f,
+                    min.y + size.y * 0.25f + (u + v) * size.y * 0.30f - std::clamp(stroke.amount, -20.0f, 20.0f) * size.y * 0.01f), radius, color, 12);
             }
         }
-        dl->AddRect(min, max, IM_COL32(105, 127, 143, 255), 4.0f, 0, 1.0f);
         dl->PopClipRect();
     }
     static void DrawTerrainTileThumbnail(const SceneTerrainTile& tile, ImVec2 size) {
@@ -3261,6 +3300,12 @@ namespace editor {
         if (!g_cameraMode) ToggleCameraMode();
         if (!g_cameraMode) return;
         g_cameraViewMode = 0; core::FreeCamFocus(center, radius);
+    }
+    static Vec3 TerrainTileTravelPos(const SceneTerrainTile& tile) {
+        Vec3 pos{ tile.tx * 1024.0f + 512.0f, 0, tile.tz * 1024.0f + 512.0f };
+        if (!tile.strokes.empty()) { pos = {}; for (const auto& s : tile.strokes) { pos.x += s.x; pos.y += s.y; pos.z += s.z; }
+            const float inv = 1.0f / (float)tile.strokes.size(); pos.x *= inv; pos.y *= inv; pos.z *= inv; }
+        return pos;
     }
     static void DeleteTerrainTileAction(int tx, int tz, int project) {
         if (!PrepareHistoryMutation([tx, tz, project]() { DeleteTerrainTileAction(tx, tz, project); })) return;
@@ -3310,6 +3355,8 @@ namespace editor {
         }
         else if (!g_sel.count(o.uid)) SelectUid(o.uid, false, list);   // grouped members select their group by default
         if (!o.note.empty()) { ImGui::TextDisabled("%s", o.note.c_str()); ImGui::Separator(); }
+        const int prefabIndex = IndexOfPrefab(o.prefab);
+        if (prefabIndex >= 0 && ImGui::MenuItem(T(core::IsFavorite(prefabIndex) ? "remove favorite" : "add favorite"))) core::ToggleFavorite(prefabIndex);
         ImGui::BeginDisabled(!core::FreeCamAvailable());
         if (ImGui::MenuItem(T("Focus"))) FocusSelection();
         ImGui::EndDisabled();
@@ -3396,6 +3443,7 @@ namespace editor {
         if (!ImGui::BeginPopupContextItem(id)) return;
         if (!g_managedNpcSel.count(n.uid)) SelectManagedNpc(n.uid, false);
         if (!n.note.empty()) { ImGui::TextDisabled("%s", n.note.c_str()); ImGui::Separator(); }
+        NpcFavoriteMenu(n.key);
         ImGui::BeginDisabled(!core::FreeCamAvailable()); if (ImGui::MenuItem(T("Focus"))) FocusSelection(); ImGui::EndDisabled();
         ImGui::BeginDisabled(!core::TravelAvailable());
         if (ImGui::MenuItem(T("Travel here"))) TravelGo(ManagedNpcDisplayPos(n), ManagedNpcHistoryName(n).c_str());
@@ -3480,6 +3528,7 @@ namespace editor {
             ImGui::PushID(SceneEntityKey(e)); const ImVec2 p0 = ImGui::GetCursorScreenPos(), p1 = { p0.x + cw, p0.y + ch }; const ImVec2 t0 = { p0.x + pad, p0.y + pad }, t1 = { t0.x + tile, t0.y + tile };
             ImGui::InvisibleButton("entitycard", ImVec2(cw, ch)); const bool hov = ImGui::IsItemHovered(), sel = SceneEntitySelected(e);
             if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) { ImGuiIO& io = ImGui::GetIO(); SelectSceneEntity(e, CtrlHeld(io), ShiftHeld(io), entities, objects, npcs); }
+            if (!e.hidden && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 6.0f)) g_sceneDragKey = SceneEntityKey(e);
             if (e.npc) SceneNpcContext(npcs[e.index], havePos, "entityctx"); else SceneObjectContext(objects[e.index], objects, havePos, "entityctx");
             dl->AddRectFilled(p0, p1, sel ? ImGui::GetColorU32(ImGuiCol_Header) : hov ? ImGui::GetColorU32(ImGuiCol_FrameBgHovered) : ImGui::GetColorU32(ImGuiCol_FrameBg), 4.0f);
             if (sel) dl->AddRect(p0, p1, ImGui::GetColorU32(ImGuiCol_HeaderActive), 4.0f, 0, 2.0f);
@@ -3525,10 +3574,13 @@ namespace editor {
                 ImGui::BeginDisabled(!core::FreeCamAvailable());
                 if (ImGui::MenuItem(T("Focus"))) FocusTerrainTile(terrain);
                 ImGui::EndDisabled();
+                ImGui::BeginDisabled(!core::TravelAvailable());
+                if (ImGui::MenuItem(T("Travel here"))) TravelGo(TerrainTileTravelPos(terrain), T("Terrain"));
+                ImGui::EndDisabled();
                 if (ImGui::MenuItem(T("Delete"))) DeleteTerrainTileAction(terrain.tx, terrain.tz, terrain.project);
                 ImGui::EndPopup();
             }
-            dl->AddRectFilled(p0, p1, selected ? ImGui::GetColorU32(ImGuiCol_Header) : hovered ? ImGui::GetColorU32(ImGuiCol_FrameBgHovered) : ImGui::GetColorU32(ImGuiCol_FrameBg), 4.0f);
+            dl->AddRectFilled(p0, p1, hovered ? ImGui::GetColorU32(ImGuiCol_FrameBgHovered) : ImGui::GetColorU32(ImGuiCol_FrameBg), 4.0f);
             if (selected) dl->AddRect(p0, p1, ImGui::GetColorU32(ImGuiCol_HeaderActive), 4.0f, 0, 2.0f);
             PaintTerrainTileThumbnail(terrain, t0, t1, dl);
             char name[96]; snprintf(name, sizeof name, T("Terrain tile %d, %d"), terrain.tx, terrain.tz);
@@ -3567,6 +3619,7 @@ namespace editor {
         ImGui::EndDisabled();
         if (!core::IsProjectLoaded(name)) ImGui::TextWrapped("%s", T("The editing project is not loaded yet. Enter the game world, move your character, then load it."));
     }
+    static void SelectNativeWorldObject(uintptr_t handle);
     static void DrawScene(const PosInfo& p, bool havePos, bool compact = false) {
         auto objects = core::Spawned(); auto npcs = core::ManagedNpcs(); const auto chars = thumbgen::Characters();
         const float ui = ImGui::GetFontSize() / 17.0f;
@@ -3611,7 +3664,7 @@ namespace editor {
             std::vector<std::pair<int,bool>> rows; for(int x:order){if(x>0)rows.push_back({x-1,false});else{rows.push_back({x,false});if(!g_closedGroups.count(-x))for(int ei:groups[-x])rows.push_back({ei,true});}}
             for(const auto&rw:rows){
                 if(rw.first<0){const int gid=-rw.first;const auto&mem=groups[gid];bool all=true;for(int ei:mem)all&=SceneEntitySelected(entities[ei]);ImGui::TableNextRow();ImGui::TableSetColumnIndex(0);ImGui::PushID(gid);if(ImGui::Button(g_closedGroups.count(gid)?">":"v")){if(g_closedGroups.count(gid))g_closedGroups.erase(gid);else g_closedGroups.insert(gid);}ImGui::PopID();ImGui::TableSetColumnIndex(1);const std::string gn=core::GroupName(gid);char gl[240];if(!gn.empty())snprintf(gl,sizeof gl,"%s  (%d)##g%d",gn.c_str(),(int)mem.size(),gid);else snprintf(gl,sizeof gl,T("Group %d  (%d entities)##g%d"),gid,(int)mem.size(),gid);if(ImGui::Selectable(gl,all,ImGuiSelectableFlags_SpanAllColumns))SelectSceneGroup(gid,entities,CtrlHeld(ImGui::GetIO()));if(ImGui::BeginPopupContextItem("groupctx")){if(ImGui::MenuItem(T("Rename group")))OpenGroupNameEdit(gid);DrawSceneGroupTravelItem(mem,entities,objects,npcs,gn);if(ImGui::MenuItem(T("Ungroup"))){SelectSceneGroup(gid,entities,false);GroupSceneSelection(false);}if(ImGui::MenuItem(T("Delete"))){SelectSceneGroup(gid,entities,false);DeleteSceneSelection();}ImGui::EndPopup();}ImGui::TableSetColumnIndex(3);ImGui::TextDisabled("%d",gid);continue;}
-                const SceneEntityRef&e=entities[rw.first];const Vec3 pos=SceneEntityPos(e,objects,npcs);const std::string name=SceneEntityName(e,objects,npcs,chars?chars.get():nullptr);ImGui::PushID(SceneEntityKey(e));ImGui::TableNextRow();ImGui::TableSetColumnIndex(0);char id[24];snprintf(id,sizeof id,"%c%d",e.npc?'N':'#',e.uid);if(rw.second)ImGui::Indent(12);if(ImGui::Selectable(id,SceneEntitySelected(e),ImGuiSelectableFlags_SpanAllColumns)){ImGuiIO&io=ImGui::GetIO();SelectSceneEntity(e,CtrlHeld(io),ShiftHeld(io),entities,objects,npcs);}if(e.npc)SceneNpcContext(npcs[e.index],havePos,"rowctx");else SceneObjectContext(objects[e.index],objects,havePos,"rowctx");if(rw.second)ImGui::Unindent(12);
+                const SceneEntityRef&e=entities[rw.first];const Vec3 pos=SceneEntityPos(e,objects,npcs);const std::string name=SceneEntityName(e,objects,npcs,chars?chars.get():nullptr);ImGui::PushID(SceneEntityKey(e));ImGui::TableNextRow();ImGui::TableSetColumnIndex(0);char id[24];snprintf(id,sizeof id,"%c%d",e.npc?'N':'#',e.uid);if(rw.second)ImGui::Indent(12);if(ImGui::Selectable(id,SceneEntitySelected(e),ImGuiSelectableFlags_SpanAllColumns)){ImGuiIO&io=ImGui::GetIO();SelectSceneEntity(e,CtrlHeld(io),ShiftHeld(io),entities,objects,npcs);}if(!e.hidden&&ImGui::IsItemActive()&&ImGui::IsMouseDragging(ImGuiMouseButton_Left,6.0f))g_sceneDragKey=SceneEntityKey(e);if(e.npc)SceneNpcContext(npcs[e.index],havePos,"rowctx");else SceneObjectContext(objects[e.index],objects,havePos,"rowctx");if(rw.second)ImGui::Unindent(12);
                 ImGui::TableSetColumnIndex(1);if(e.hidden)ImGui::TextDisabled(T("%s (deleted)"),name.c_str());else ImGui::TextUnformatted(name.c_str());
                 const std::string note=e.npc?npcs[e.index].note:objects[e.index].note;if(!note.empty()&&ImGui::IsItemHovered())ImGui::SetTooltip("%s",note.c_str());
                 ImGui::TableSetColumnIndex(2);ImGui::TextDisabled("%s",e.npc?T("NPC"):T("Object"));ImGui::TableSetColumnIndex(3);if(e.group)ImGui::TextDisabled("%d",e.group);
@@ -3627,6 +3680,9 @@ namespace editor {
                 if (ImGui::BeginPopupContextItem("terrain-rowctx")) {
                     ImGui::BeginDisabled(!core::FreeCamAvailable());
                     if (ImGui::MenuItem(T("Focus"))) FocusTerrainTile(tile);
+                    ImGui::EndDisabled();
+                    ImGui::BeginDisabled(!core::TravelAvailable());
+                    if (ImGui::MenuItem(T("Travel here"))) TravelGo(TerrainTileTravelPos(tile), T("Terrain"));
                     ImGui::EndDisabled();
                     if (ImGui::MenuItem(T("Delete"))) DeleteTerrainTileAction(tile.tx, tile.tz, tile.project);
                     ImGui::EndPopup();
@@ -3660,6 +3716,32 @@ namespace editor {
             SameLineForControl("Delete");
             if (ImGui::Button(T("Delete"))) DeleteTerrainTileAction(selectedTerrain->tx, selectedTerrain->tz, selectedTerrain->project);
         } else if (!entities.empty()) ImGui::TextDisabled("%s", T("Select an object or NPC to inspect it. Ctrl-click adds, Shift-click selects a range."));
+        const auto worldOverrides = core::NativeWorldOverrides();
+        char worldHeader[96]; snprintf(worldHeader, sizeof worldHeader, "World overrides (%d)###world-overrides", (int)worldOverrides.size());
+        if (ImGui::CollapsingHeader(TStable(worldHeader))) {
+            ImGui::TextDisabled("%s", T("Saved edits to game objects; matched by prefab and original position when the world loads."));
+            ImGui::BeginChild("scene-world-overrides", ImVec2(0, std::min(180.0f * ui, 28.0f * ui * std::max<size_t>(1, worldOverrides.size()))), ImGuiChildFlags_Borders);
+            for (size_t i = 0; i < worldOverrides.size(); ++i) {
+                const auto& native = worldOverrides[i]; ImGui::PushID((int)i);
+                const std::string label = ShortName(native.prefab) + (native.deleted ? "  [World override: deleted]" : "  [World override]");
+                if (ImGui::Selectable(label.c_str(), native.handle && native.handle == g_nativeWorldSelected)) {
+                    if (native.handle) SelectNativeWorldObject(native.handle);
+                    g_mainTab = g_compactPage = TabWorld; g_selectMainTab = true;
+                }
+                if (ImGui::BeginPopupContextItem("world-override-ctx")) {
+                    const int index = IndexOfPrefab(native.prefab);
+                    if (index >= 0 && ImGui::MenuItem(T(core::IsFavorite(index) ? "remove favorite" : "add favorite"))) core::ToggleFavorite(index);
+                    ImGui::BeginDisabled(!core::TravelAvailable());
+                    if (ImGui::MenuItem(T("Travel here"))) TravelGo(native.pos, ShortName(native.prefab).c_str());
+                    ImGui::EndDisabled();
+                    ImGui::BeginDisabled(!native.handle);
+                    if (ImGui::MenuItem(T("Restore original"))) core::ResetNativeWorldObject(native.handle);
+                    ImGui::EndDisabled(); ImGui::EndPopup();
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndChild();
+        }
         if (ImGui::CollapsingHeader(TStable("Grounding operations"))) DrawProjectGrounding();
         footerHeight = ImGui::GetCursorPosY() - footerStart;
     }
@@ -4804,6 +4886,46 @@ namespace editor {
         }
         if (n < 4) return false; *depth = dsum / n; return true;
     }
+    static bool NativeObjectScreenRect(const CamFrame& cf, const core::NativeWorldObject& n, ImVec2* mn, ImVec2* mx, float* depth) {
+        static std::unordered_map<std::string, const core::PrefabInfo*> prefabByPath;
+        static size_t indexedPrefabCount = 0;
+        const auto& prefabs = core::PrefabIndex();
+        if (indexedPrefabCount != prefabs.size()) {
+            prefabByPath.clear();
+            prefabByPath.reserve(prefabs.size());
+            for (const auto& prefab : prefabs) prefabByPath.emplace(prefab.path, &prefab);
+            indexedPrefabCount = prefabs.size();
+        }
+        float cx = 0, cy = 0.5f, cz = 0, sx = 1, sy = 1, sz = 1;
+        const auto found = prefabByPath.find(n.prefab);
+        if (found != prefabByPath.end()) {
+            const auto& info = *found->second;
+            if (info.hasCenter) { cx = info.cx; cy = info.cy; cz = info.cz; }
+            if (info.sx > 0) { sx = info.sx; sy = info.sy; sz = info.sz; }
+        }
+        *mn = { 1e9f, 1e9f }; *mx = { -1e9f, -1e9f };
+        float depthSum = 0; int visibleCorners = 0;
+        for (int k = 0; k < 8; ++k) {
+            const Vec3 offset = RotLocal(n.rot,
+                (cx + ((k & 1) ? sx : -sx) * 0.5f) * n.scale,
+                (cy + ((k & 2) ? sy : -sy) * 0.5f) * n.scale,
+                (cz + ((k & 4) ? sz : -sz) * 0.5f) * n.scale);
+            const Vec3 world = { n.pos.x + offset.x, n.pos.y + offset.y, n.pos.z + offset.z };
+            ImVec2 screen;
+            if (!WorldToScreen(cf, world, &screen)) continue;
+            mn->x = std::min(mn->x, screen.x); mn->y = std::min(mn->y, screen.y);
+            mx->x = std::max(mx->x, screen.x); mx->y = std::max(mx->y, screen.y);
+            const Vec3 delta = { world.x - cf.pos.x, world.y - cf.pos.y, world.z - cf.pos.z };
+            depthSum += delta.x * cf.fwd.x + delta.y * cf.fwd.y + delta.z * cf.fwd.z;
+            ++visibleCorners;
+        }
+        if (visibleCorners < 4) return false;
+        *depth = depthSum / visibleCorners;
+        return true;
+    }
+    static void SelectNativeWorldObject(uintptr_t handle) {
+        ClearSceneSelection(); g_terrainTileSelected = false; g_nativeWorldSelected = handle; g_nativeEditHandle = 0;
+    }
     // edit mode: a click on a placed object selects it (Ctrl adds), a double-click grabs the selection
     static bool IsCarried(int uid) { if (!g_place.active) return false; for (const auto& m : g_place.m) if (!m.npc && m.uid == uid) return true; return false; }
     static bool IsNpcCarried(int uid) { if (!g_place.active) return false; for (const auto& m : g_place.m) if (m.npc && m.uid == uid) return true; return false; }
@@ -4831,7 +4953,7 @@ namespace editor {
         if(ImGui::IsMouseReleased(ImGuiMouseButton_Left)){if(!g_boxMoved&&!g_boxAdd)ClearSceneSelection();g_boxSelecting=g_boxMoved=g_boxAdd=false;g_boxBase.clear();g_boxNpcBase.clear();}
     }
     static void ClickSelect(const PosInfo& p, bool havePos) {
-        (void)p;(void)havePos;g_hoverUid=g_hoverNpcUid=0;ImGuiIO&io=ImGui::GetIO();if(g_browserDragPrefab>=0||g_npcDragIndex>=0||g_blueprintDragging)return;if(BrushActive())return;
+        (void)p;(void)havePos;g_hoverUid=g_hoverNpcUid=0;g_nativeWorldHover=0;ImGuiIO&io=ImGui::GetIO();if(g_browserDragPrefab>=0||g_npcDragIndex>=0||g_blueprintDragging)return;if(BrushActive())return;
         const bool overUi = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) || ImGui::IsAnyItemHovered();
         const bool addSelect=CtrlHeld(io),addBox=CtrlHeld(io)||ShiftHeld(io),placing=g_place.active;if(g_playMode)return;
         if (io.MouseClicked[ImGuiMouseButton_Left]) {
@@ -4845,12 +4967,27 @@ namespace editor {
             if (key < 0) { const auto* n = FindManagedNpc(npcs, -key); return n && EditableProject(n->proj); }
             return false;
         };
-        if(g_rightGesture){if(io.MouseDown[ImGuiMouseButton_Right]){float dx=io.MousePos.x-g_rightStart.x,dy=io.MousePos.y-g_rightStart.y;if(dx*dx+dy*dy>16)g_rightMoved=true;}if(ImGui::IsMouseReleased(ImGuiMouseButton_Right)){if(!g_rightMoved&&g_rightUid&&editableKey(g_rightUid)){if(g_rightUid>0){if(IsCarried(g_rightUid)){ClearSceneSelection();for(const auto&m:g_place.m){if(m.npc)g_managedNpcSel.insert(m.uid);else g_sel.insert(m.uid);}g_primary=g_lastClicked=g_rightUid;g_sceneLastEntity=g_rightUid;}else if(!g_sel.count(g_rightUid))SelectUid(g_rightUid,false,objects);}else{const int uid=-g_rightUid;if(!g_managedNpcSel.count(uid))SelectManagedNpc(uid,false);}g_worldPopupRequested=true;g_worldPopupPos=io.MousePos;}g_rightGesture=g_rightMoved=false;g_rightUid=0;}}
-        if(overUi&&!g_boxSelecting)return;if(ImGui::IsMouseClicked(ImGuiMouseButton_Right)){g_rightGesture=true;g_rightMoved=false;g_rightStart=io.MousePos;g_rightUid=0;if(placing&&!g_place.m.empty()){const auto&m=g_place.m.front();g_rightUid=m.npc?-m.uid:m.uid;}}
+        if (g_rightGesture && ImGui::IsMouseReleased(ImGuiMouseButton_Right) && !g_rightMoved && g_rightNative) {
+            SelectNativeWorldObject(g_rightNative); g_worldPopupRequested = true; g_worldPopupPos = io.MousePos;
+            g_rightGesture = g_rightMoved = false; g_rightNative = 0; g_rightUid = 0; return;
+        }
+        if(g_rightGesture){if(io.MouseDown[ImGuiMouseButton_Right]){float dx=io.MousePos.x-g_rightStart.x,dy=io.MousePos.y-g_rightStart.y;if(dx*dx+dy*dy>16)g_rightMoved=true;}if(ImGui::IsMouseReleased(ImGuiMouseButton_Right)){if(!g_rightMoved&&g_rightUid&&editableKey(g_rightUid)){if(g_rightUid>0){if(IsCarried(g_rightUid)){ClearSceneSelection();for(const auto&m:g_place.m){if(m.npc)g_managedNpcSel.insert(m.uid);else g_sel.insert(m.uid);}g_primary=g_lastClicked=g_rightUid;g_sceneLastEntity=g_rightUid;}else if(!g_sel.count(g_rightUid))SelectUid(g_rightUid,false,objects);}else{const int uid=-g_rightUid;if(!g_managedNpcSel.count(uid))SelectManagedNpc(uid,false);}g_worldPopupRequested=true;g_worldPopupPos=io.MousePos;}g_rightGesture=g_rightMoved=false;g_rightUid=0;g_rightNative=0;}}
+        if(overUi&&!g_boxSelecting)return;if(ImGui::IsMouseClicked(ImGuiMouseButton_Right)){g_rightGesture=true;g_rightMoved=false;g_rightStart=io.MousePos;g_rightUid=0;g_rightNative=0;if(placing&&!g_place.m.empty()){const auto&m=g_place.m.front();g_rightUid=m.npc?-m.uid:m.uid;}}
         CamFrame cf=CurrentCam();if(!cf.ok){if(ImGui::IsMouseReleased(ImGuiMouseButton_Left)){g_boxSelecting=g_boxMoved=g_boxAdd=false;g_boxBase.clear();g_boxNpcBase.clear();}return;}
         if(g_boxSelecting){UpdateBoxSelection(cf,objects,npcs,io);if(g_boxSelecting||overUi)return;}if(placing&&(g_place.hover||g_place.drag))return;
-        float bestDepth=1e30f;int bestKey=0;for(const auto&o:objects){if(o.hidden||IsCarried(o.uid))continue;ImVec2 mn,mx;float d;if(!ObjScreenRect(cf,o,&mn,&mx,&d)||d<=0)continue;if(io.MousePos.x<mn.x||io.MousePos.x>mx.x||io.MousePos.y<mn.y||io.MousePos.y>mx.y)continue;if(d<bestDepth){bestDepth=d;bestKey=o.uid;}}
+        float bestDepth=1e30f;int bestKey=0;uintptr_t bestNative=0;for(const auto&o:objects){if(o.hidden||IsCarried(o.uid))continue;ImVec2 mn,mx;float d;if(!ObjScreenRect(cf,o,&mn,&mx,&d)||d<=0)continue;if(io.MousePos.x<mn.x||io.MousePos.x>mx.x||io.MousePos.y<mn.y||io.MousePos.y>mx.y)continue;if(d<bestDepth){bestDepth=d;bestKey=o.uid;}}
         for(const auto&n:npcs){if(n.hidden||IsNpcCarried(n.uid))continue;ImVec2 mn,mx;float d;if(!NpcScreenRect(cf,n,&mn,&mx,&d))continue;if(io.MousePos.x<mn.x||io.MousePos.x>mx.x||io.MousePos.y<mn.y||io.MousePos.y>mx.y)continue;if(d<bestDepth){bestDepth=d;bestKey=-n.uid;}}
+        static std::vector<core::NativeWorldObject> nativeCandidates;
+        if (g_nativeWorldPick) {
+            core::NativeWorldObjectsNear(cf.pos, 120, nativeCandidates);
+            for (const auto& n : nativeCandidates) {
+                if (n.deleted) continue;
+                ImVec2 mn, mx; float d = 0; if (!NativeObjectScreenRect(cf, n, &mn, &mx, &d) || d <= 0) continue;
+                if (io.MousePos.x < mn.x || io.MousePos.x > mx.x || io.MousePos.y < mn.y || io.MousePos.y > mx.y) continue;
+                if (d < bestDepth) { bestDepth = d; bestKey = 0; bestNative = n.handle; }
+            }
+        }
+        g_nativeWorldHover = bestNative;
         if(bestKey>0)g_hoverUid=bestKey;else if(bestKey<0)g_hoverNpcUid=-bestKey;
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !overUi) {
             static int reports = 0;
@@ -4875,14 +5012,15 @@ namespace editor {
                     cf.pos.x, cf.pos.y, cf.pos.z, cf.fwd.x, cf.fwd.y, cf.fwd.z, io.MousePos.x, io.MousePos.y);
             }
         }
-        if(ImGui::IsMouseClicked(ImGuiMouseButton_Right)){if(editableKey(bestKey))g_rightUid=bestKey;return;}
+        if(ImGui::IsMouseClicked(ImGuiMouseButton_Right)){if(bestNative)g_rightNative=bestNative;else if(editableKey(bestKey))g_rightUid=bestKey;return;}
+        if(bestNative){if(ImGui::IsMouseClicked(ImGuiMouseButton_Left)){SelectNativeWorldObject(bestNative);g_mainTab=TabWorld;g_compactPage=TabWorld;g_selectMainTab=true;}return;}
         if(bestKey && !editableKey(bestKey)) return;
         if(!bestKey){if(placing){if(ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))DropCarried();return;}if(ImGui::IsMouseClicked(ImGuiMouseButton_Left)){g_terrainTileSelected=false;g_boxSelecting=true;g_boxMoved=false;g_boxAdd=addBox;g_boxStart=g_boxCurrent=io.MousePos;g_boxBase=g_boxAdd?g_sel:std::set<int>{};g_boxNpcBase=g_boxAdd?g_managedNpcSel:std::set<int>{};}return;}
         if(ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)){if(bestKey>0){SelectSingleUid(bestKey);StartGrab({bestKey},false,ShortName(Find(objects,bestKey)->prefab));}else{const int uid=-bestKey;SelectManagedNpc(uid,false);const ManagedNpc*n=FindManagedNpc(npcs,uid);StartGrab({bestKey},false,n?ManagedNpcHistoryName(*n):std::string("NPC"));}return;}
         if(ImGui::IsMouseClicked(ImGuiMouseButton_Left)){if(bestKey>0)SelectUid(bestKey,addSelect,objects);else SelectManagedNpc(-bestKey,addSelect);g_editUid=0;}
 
     }
-    static bool BrowserDropPoint(const core::PrefabInfo& pi, ImVec2 mouse, Vec3* center, bool* onGroundPlane) {
+    static bool BrowserDropPoint(const core::PrefabInfo& pi, ImVec2 mouse, Vec3* center, bool* onGroundPlane, float scale) {
         CamFrame cf = CurrentCam(); if (!cf.ok) return false;
         const Vec3 rd = MouseRay(cf, mouse);
         PosInfo pp{}; const bool havePlayer = core::PlayerPosInfo(&pp);
@@ -4892,25 +5030,25 @@ namespace editor {
             if (t > 0.25f && t < 500.0f) { hit = { cf.pos.x + rd.x * t, pp.world.y, cf.pos.z + rd.z * t }; plane = true; }
         }
         if (!plane) {
-            const float extent = std::max(pi.sx, std::max(pi.sy, pi.sz)) * g_spawnScale;
+            const float extent = std::max(pi.sx, std::max(pi.sy, pi.sz)) * scale;
             const float dist = std::max(5.0f, std::min(80.0f, 6.0f + extent * 0.75f));
             hit = { cf.pos.x + rd.x * dist, cf.pos.y + rd.y * dist, cf.pos.z + rd.z * dist };
         } else if (pi.hasCenter && pi.sy > 0.0f) {
-            hit.y += pi.sy * g_spawnScale * 0.5f;   // cursor marks the surface; placement center is the box center
+            hit.y += pi.sy * scale * 0.5f;   // cursor marks the surface; placement center is the box center
         }
         *center = hit; if (onGroundPlane) *onGroundPlane = plane; return true;
     }
-    static void SpawnBrowserDrop(int prefab, Vec3 center, float yaw, float scale) {
-        if (!PrepareHistoryMutation([=]() { SpawnBrowserDrop(prefab, center, yaw, scale); })) return;
+    static void SpawnBrowserDrop(int prefab, Vec3 center, Rot rot, float scale) {
+        if (!PrepareHistoryMutation([=]() { SpawnBrowserDrop(prefab, center, rot, scale); })) return;
         const auto& idx = core::PrefabIndex(); if (prefab < 0 || prefab >= (int)idx.size()) return;
         const auto& pi = idx[prefab]; g_selPrefab = prefab;
         if (g_previewShown) { core::PreviewClear(); g_previewShown = false; }
         Vec3 at = center;
         if (pi.hasCenter) {
-            const float t = yaw * 3.14159265f / 180.0f, cs = cosf(t), sn = sinf(t);
-            at.x -= scale * (cs * pi.cx + sn * pi.cz); at.z -= scale * (-sn * pi.cx + cs * pi.cz); at.y -= scale * pi.cy;
+            const Vec3 offset = RotLocal(rot, pi.cx * scale, pi.cy * scale, pi.cz * scale);
+            at.x -= offset.x; at.y -= offset.y; at.z -= offset.z;
         }
-        const int uid = core::SpawnAt(pi.path, at, Rot{ yaw }, scale);
+        const int uid = core::SpawnAt(pi.path, at, rot, scale);
         if (uid) StartGrab({ uid }, true, ShownName(pi));
     }
     static void PumpBrowserDropJobs() {
@@ -4919,14 +5057,14 @@ namespace editor {
             BrowserDropJob& j = g_browserDropJobs[i]; core::GroundHit gh;
             if (g_deferredEditor.action || !ReconcileGroundBatch(false)) return;
             if (g_place.active) { DropCarried(); if (g_place.active) { ++i; continue; } }
-            if (GetTickCount() - j.queuedAt > 2500) {
-                SpawnBrowserDrop(j.prefab, j.center, j.yaw, j.scale);
+            if (GetTickCount() - j.queuedAt > 8000) {
+                Note("Ground probe timed out; object was not placed");
                 g_browserDropJobs.erase(g_browserDropJobs.begin() + i); continue;
             }
             const auto status = core::GroundResultState(j.ticket, &gh);
             if (status == core::GroundProbeStatus::Pending) { ++i; continue; }
             if (status == core::GroundProbeStatus::Invalidated || status == core::GroundProbeStatus::Unknown) {
-                SpawnBrowserDrop(j.prefab, j.center, j.yaw, j.scale);
+                Note("Ground changed during placement; object was not placed");
                 g_browserDropJobs.erase(g_browserDropJobs.begin() + i); continue;
             }
             if (status != core::GroundProbeStatus::Hit || !gh.hit || !std::isfinite(gh.centerY)) {
@@ -4934,7 +5072,7 @@ namespace editor {
                     j.ticket = core::GroundProbe({ j.center.x, j.probeTop + 300.0f, j.center.z }, 1000.0f);
                     if (j.ticket) { ++i; continue; }
                 }
-                SpawnBrowserDrop(j.prefab, j.center, j.yaw, j.scale);
+                Note("No ground found under object; it was not placed");
                 g_browserDropJobs.erase(g_browserDropJobs.begin() + i); continue;
             }
             Vec3 center = j.center;
@@ -4942,9 +5080,16 @@ namespace editor {
                 const auto& pi = idx[j.prefab]; const float groundY = gh.centerY - gh.radius;
                 // BrowserDropPoint stores a bbox center when bounds are known.  Put its lowest point exactly on the
                 // physical surface; the prefab pivot is recovered by SpawnBrowserDrop afterwards.
-                center.y = groundY + (pi.hasCenter ? std::max(0.0f, pi.sy) * j.scale * 0.5f : 0.0f);
+                float halfHeight = 0.0f;
+                if (pi.hasCenter) for (int corner = 0; corner < 8; ++corner) {
+                    const Vec3 extent = RotLocal(j.rot, ((corner & 1) ? 1.0f : -1.0f) * pi.sx * j.scale * 0.5f,
+                        ((corner & 2) ? 1.0f : -1.0f) * pi.sy * j.scale * 0.5f,
+                        ((corner & 4) ? 1.0f : -1.0f) * pi.sz * j.scale * 0.5f);
+                    halfHeight = std::max(halfHeight, std::fabs(extent.y));
+                }
+                center.y = groundY + halfHeight;
             }
-            SpawnBrowserDrop(j.prefab, center, j.yaw, j.scale);
+            SpawnBrowserDrop(j.prefab, center, j.rot, j.scale);
             g_browserDropJobs.erase(g_browserDropJobs.begin() + i);
         }
     }
@@ -4955,7 +5100,7 @@ namespace editor {
         ImGuiIO& io = ImGui::GetIO(); const auto& pi = idx[g_browserDragPrefab];
         if (!io.MouseDown[ImGuiMouseButton_Left] && !ImGui::IsMouseReleased(ImGuiMouseButton_Left)) { g_browserDragPrefab = -1; return; }
         const bool overUi = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) || ImGui::IsAnyItemHovered();
-        Vec3 center{}; const bool projected = BrowserDropPoint(pi, io.MousePos, &center, nullptr);
+        Vec3 center{}; const bool projected = BrowserDropPoint(pi, io.MousePos, &center, nullptr, g_spawnScale);
         ImDrawList* dl = ImGui::GetForegroundDrawList();
         const std::string shown = ShownName(pi);
         dl->AddText({ io.MousePos.x + 16.0f, io.MousePos.y + 14.0f }, IM_COL32(255, 220, 150, 255), shown.c_str());
@@ -4969,17 +5114,17 @@ namespace editor {
             prefab, (int)overUi, (int)projected, (int)core::GameThreadReady(), (int)core::GroundProbeReady(), center.x, center.y, center.z);
         if (overUi || !projected || !core::GameThreadReady() || IsAppearance(pi)) return;
         if (!core::GroundProbeReady()) {
-            g_browserDropJobs.push_back({ prefab, 0, GetTickCount(), center, g_spawnYaw, g_spawnScale });
+            Note("Ground probe unavailable; object was not placed");
             return;
         }
         const CamFrame cf = CurrentCam();
         const float startY = std::max(center.y, cf.ok ? cf.pos.y : center.y) + 150.0f;
         const int ticket = core::GroundProbe({ center.x, startY, center.z }, 500.0f);
         if (!ticket) {
-            g_browserDropJobs.push_back({ prefab, 0, GetTickCount(), center, g_spawnYaw, g_spawnScale });
+            Note("Ground probe unavailable; object was not placed");
             return;
         }
-        g_browserDropJobs.push_back({ prefab, ticket, GetTickCount(), center, g_spawnYaw, g_spawnScale });
+        g_browserDropJobs.push_back({ prefab, ticket, GetTickCount(), center, Rot{ g_spawnYaw }, g_spawnScale });
         g_browserDropJobs.back().probeTop = startY;
     }
     static bool NpcDropPoint(ImVec2 mouse, Vec3* at, bool* onGroundPlane) {
@@ -5027,15 +5172,15 @@ namespace editor {
             NpcDropJob& j = g_npcDropJobs[i]; core::GroundHit gh;
             if (g_deferredEditor.action || !ReconcileGroundBatch(false)) return;
             if (g_place.active) { DropCarried(); if (g_place.active) { ++i; continue; } }
-            if (GetTickCount() - j.queuedAt > 2500) {
-                SpawnNpcFormation(j.key, j.at, j.count, j.formation, j.spacing, j.radius, j.fx, j.fz, j.ai, j.behavior);
+            if (GetTickCount() - j.queuedAt > 8000) {
+                Note("Ground probe timed out; NPC was not placed");
                 g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue;
             }
             if (!j.centerResolved) {
                 const auto status = core::GroundResultState(j.ticket, &gh);
                 if (status == core::GroundProbeStatus::Pending) { ++i; continue; }
                 if (status == core::GroundProbeStatus::Invalidated || status == core::GroundProbeStatus::Unknown) {
-                    SpawnNpcFormation(j.key, j.at, j.count, j.formation, j.spacing, j.radius, j.fx, j.fz, j.ai, j.behavior);
+                    Note("Ground changed during placement; NPC was not placed");
                     g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue;
                 }
                 if (status != core::GroundProbeStatus::Hit || !gh.hit || !std::isfinite(gh.centerY)) {
@@ -5043,7 +5188,7 @@ namespace editor {
                         j.ticket = core::GroundProbe({ j.at.x, j.probeTop + 300.0f, j.at.z }, 1000.0f);
                         if (j.ticket) { ++i; continue; }
                     }
-                    SpawnNpcFormation(j.key, j.at, j.count, j.formation, j.spacing, j.radius, j.fx, j.fz, j.ai, j.behavior);
+                    Note("No ground found under NPC; it was not placed");
                     g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue;
                 }
                 j.at.y = gh.centerY - gh.radius;
@@ -5079,8 +5224,12 @@ namespace editor {
                     pending = true;
                 } else ticket = -2;
             }
-            if (invalidated) { SpawnNpcPositions(j.key, j.positions, j.ai, j.behavior); g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue; }
+            if (invalidated) { Note("Ground changed during placement; NPC formation was not placed"); g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue; }
             if (pending) { ++i; continue; }
+            if (std::find(j.memberTickets.begin(), j.memberTickets.end(), -2) != j.memberTickets.end()) {
+                Note("No ground found under the full NPC formation; it was not placed");
+                g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue;
+            }
             SpawnNpcPositions(j.key, j.positions, j.ai, j.behavior);
             g_npcDropJobs.erase(g_npcDropJobs.begin() + i);
         }
@@ -5109,6 +5258,39 @@ namespace editor {
         CamFrame cf = CurrentCam(); float fx = cf.ok ? cf.fwd.x : g_fx, fz = cf.ok ? cf.fwd.z : g_fz;
         const float fl = sqrtf(fx * fx + fz * fz); if (fl > 1e-4f) { fx /= fl; fz /= fl; } else { fx = g_fx; fz = g_fz; }
         SpawnNpcFormationGrounded(key, at, g_npcCount, g_npcFormation, g_npcSpacing, g_npcRadius, fx, fz, g_npcSpawnAi, g_npcSpawnBehavior);
+    }
+    static void ProcessSceneDrag() {
+        if (!g_sceneDragKey) return;
+        ImGuiIO& io = ImGui::GetIO();
+        if (!io.MouseDown[ImGuiMouseButton_Left] && !ImGui::IsMouseReleased(ImGuiMouseButton_Left)) { g_sceneDragKey = 0; return; }
+        const int key = g_sceneDragKey;
+        const bool overUi = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) || ImGui::IsAnyItemHovered();
+        const auto objects = core::Spawned(); const auto npcs = core::ManagedNpcs();
+        const SpawnedObj* object = key > 0 ? Find(objects, key) : nullptr;
+        const ManagedNpc* npc = key < 0 ? FindManagedNpc(npcs, -key) : nullptr;
+        if ((!object && !npc) || (object && object->hidden) || (npc && npc->hidden)) { g_sceneDragKey = 0; return; }
+        Vec3 at{}; bool projected = false; int prefab = -1;
+        if (object) {
+            prefab = IndexOfPrefab(object->prefab);
+            if (prefab >= 0) projected = BrowserDropPoint(core::PrefabIndex()[prefab], io.MousePos, &at, nullptr, object->scale);
+        } else projected = NpcDropPoint(io.MousePos, &at, nullptr);
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        const std::string name = object ? ShortName(object->prefab) : ManagedNpcHistoryName(*npc);
+        dl->AddText({ io.MousePos.x + 16.0f, io.MousePos.y + 14.0f }, IM_COL32(255, 220, 150, 255), name.c_str());
+        if (!overUi && projected) { ImVec2 screen{}; if (WorldToScreen(CurrentCam(), at, &screen)) dl->AddCircle(screen, 11.0f, IM_COL32(255, 190, 90, 255), 24, 2.0f); }
+        if (!ImGui::IsMouseReleased(ImGuiMouseButton_Left)) return;
+        g_sceneDragKey = 0;
+        if (overUi || !projected) return;
+        if (object) {
+            if (prefab < 0 || !core::GameThreadReady() || !core::GroundProbeReady()) { Note("Ground probe unavailable; copy was not placed"); return; }
+            const CamFrame cf = CurrentCam(); const float top = std::max(at.y, cf.ok ? cf.pos.y : at.y) + 150.0f;
+            const int ticket = core::GroundProbe({ at.x, top, at.z }, 500.0f);
+            if (!ticket) { Note("Ground probe unavailable; copy was not placed"); return; }
+            g_browserDropJobs.push_back({ prefab, ticket, GetTickCount(), at, object->rot, object->scale, top });
+        } else {
+            if (core::NpcState() != 2) { Note(T("walk a few steps first: the game's spawn request needs your character's server actor")); return; }
+            SpawnNpcFormationGrounded(npc->key, at, 1, 0, g_npcSpacing, g_npcRadius, g_fx, g_fz, npc->aiEnabled, npc->behavior);
+        }
     }
     static bool SelectionTravelTarget(const std::vector<SpawnedObj>& objects, const std::vector<ManagedNpc>& npcs,
                                       Vec3* target, std::string* name) {
@@ -5150,7 +5332,28 @@ namespace editor {
                 if (!n->hidden && n->group > 0) { hasGroup = true; break; }
             Vec3 travelPos{}; std::string travelName;
             const bool canTravelSelection = SelectionTravelTarget(objects, npcs, &travelPos, &travelName);
+            core::NativeWorldObject native{};
+            if (g_nativeWorldSelected && !hasSel && core::FindNativeWorldObject(g_nativeWorldSelected, &native)) {
+                ImGui::TextDisabled("%s", native.prefab.c_str());
+                const int index = IndexOfPrefab(native.prefab);
+                if (index >= 0 && ImGui::MenuItem(T(core::IsFavorite(index) ? "remove favorite" : "add favorite"))) core::ToggleFavorite(index);
+                if (ImGui::MenuItem(T("Properties"))) { g_mainTab = g_compactPage = TabWorld; g_selectMainTab = true; }
+                ImGui::BeginDisabled(!core::FreeCamAvailable());
+                if (ImGui::MenuItem(T("Focus"))) { if (!g_cameraMode) ToggleCameraMode(); core::FreeCamFocus(native.pos, 5.0f); }
+                ImGui::EndDisabled();
+                ImGui::BeginDisabled(!core::TravelAvailable());
+                if (ImGui::MenuItem(T("Travel here"))) TravelGo(native.pos, ShortName(native.prefab).c_str());
+                ImGui::EndDisabled();
+                if (native.overridden && ImGui::MenuItem(T("Restore original"))) core::ResetNativeWorldObject(native.handle);
+                if (!native.deleted && ImGui::MenuItem(T("Delete"))) core::DeleteNativeWorldObject(native.handle, true);
+                ImGui::Separator(); break;
+            }
             ImGui::BeginDisabled(!hasSel);
+            if (SceneSelectionCount() == 1) {
+                if (!g_sel.empty()) { if (const auto* o = Find(objects, *g_sel.begin())) { const int index = IndexOfPrefab(o->prefab);
+                    if (index >= 0 && ImGui::MenuItem(T(core::IsFavorite(index) ? "remove favorite" : "add favorite"))) core::ToggleFavorite(index); } }
+                else if (!g_managedNpcSel.empty()) { if (const auto* n = FindManagedNpc(npcs, *g_managedNpcSel.begin())) NpcFavoriteMenu(n->key); }
+            }
             ImGui::BeginDisabled(!core::FreeCamAvailable());
             if (ImGui::MenuItem(T("Focus"))) FocusSelection();
             ImGui::EndDisabled();
@@ -5199,9 +5402,73 @@ namespace editor {
         ImGui::End();
     }
     static void DrawSelectionOutlines() {
-        if(g_sel.empty()&&g_managedNpcSel.empty()&&!g_hoverUid&&!g_hoverNpcUid)return;CamFrame cf=CurrentCam();if(!cf.ok)return;ImDrawList*dl=ImGui::GetForegroundDrawList();auto objects=core::Spawned();auto npcs=core::ManagedNpcs();const int editing=EditingProjectId();
+        if(g_sel.empty()&&g_managedNpcSel.empty()&&!g_hoverUid&&!g_hoverNpcUid&&!g_nativeWorldSelected&&!g_nativeWorldHover)return;CamFrame cf=CurrentCam();if(!cf.ok)return;ImDrawList*dl=ImGui::GetForegroundDrawList();auto objects=core::Spawned();auto npcs=core::ManagedNpcs();const int editing=EditingProjectId();
         for(const auto&o:objects){const bool editable=editing>0&&o.proj==editing,sel=editable&&g_sel.count(o.uid)>0,hov=o.uid==g_hoverUid;if(o.hidden||(!sel&&!hov))continue;float cx=0,cy=0.5f,cz=0,sx=1,sy=1,sz=1;int pi=IndexOfPrefab(o.prefab);if(pi>=0){const auto&info=core::PrefabIndex()[pi];if(info.hasCenter){cx=info.cx;cy=info.cy;cz=info.cz;}if(info.sx>0){sx=info.sx;sy=info.sy;sz=info.sz;}}ImVec2 sp[8];bool ok[8];for(int k=0;k<8;k++)ok[k]=WorldToScreen(cf,LocalToWorld(o,cx+((k&1)?sx:-sx)*0.5f,cy+((k&2)?sy:-sy)*0.5f,cz+((k&4)?sz:-sz)*0.5f),&sp[k]);static const int edges[12][2]={{0,1},{2,3},{4,5},{6,7},{0,2},{1,3},{4,6},{5,7},{0,4},{1,5},{2,6},{3,7}};const ImU32 col=!editable?IM_COL32(155,155,155,190):sel?IM_COL32(255,150,55,255):IM_COL32(255,255,255,150);for(auto&e:edges)if(ok[e[0]]&&ok[e[1]])dl->AddLine(sp[e[0]],sp[e[1]],col,sel?2.5f:1.0f);}
         for(const auto&n:npcs){const bool editable=editing>0&&n.proj==editing,sel=editable&&g_managedNpcSel.count(n.uid)>0,hov=n.uid==g_hoverNpcUid;if(n.hidden||(!sel&&!hov))continue;ImVec2 mn,mx;float dep=0;if(!NpcScreenRect(cf,n,&mn,&mx,&dep))continue;const ImU32 col=!editable?IM_COL32(155,155,155,190):sel?IM_COL32(255,150,55,255):IM_COL32(255,255,255,180);dl->AddRect(mn,mx,col,3.0f,0,sel?3.0f:1.5f);}
+        core::NativeWorldObject native{};
+        if (g_nativeWorldSelected && core::FindNativeWorldObject(g_nativeWorldSelected, &native) && !native.deleted) {
+            ImVec2 mn, mx; float depth = 0;
+            if (NativeObjectScreenRect(cf, native, &mn, &mx, &depth))
+                dl->AddRect(mn, mx, IM_COL32(255, 172, 62, 255), 3.0f, 0, 2.5f);
+        }
+        if (g_nativeWorldHover && g_nativeWorldHover != g_nativeWorldSelected &&
+            core::FindNativeWorldObject(g_nativeWorldHover, &native) && !native.deleted) {
+            ImVec2 mn, mx; float depth = 0;
+            if (NativeObjectScreenRect(cf, native, &mn, &mx, &depth))
+                dl->AddRect(mn, mx, IM_COL32(255, 255, 255, 180), 3.0f, 0, 1.5f);
+        }
+    }
+    static void DrawWorld(const PosInfo& player, bool havePos) {
+        ImGui::Checkbox(T("Select game objects in the world"), &g_nativeWorldPick);
+        ImGui::TextDisabled("%s", T("Off by default. Click a game object to edit it; changes are saved in World overrides."));
+        static std::vector<core::NativeWorldObject> nearby;
+        if (havePos) core::NativeWorldObjectsNear(player.world, 150, nearby);
+        else nearby.clear();
+        std::sort(nearby.begin(), nearby.end(), [&](const auto& a, const auto& b) {
+            const float ax = a.pos.x - player.world.x, az = a.pos.z - player.world.z;
+            const float bx = b.pos.x - player.world.x, bz = b.pos.z - player.world.z;
+            return ax * ax + az * az < bx * bx + bz * bz;
+        });
+        ImGui::TextDisabled(T("%d game objects captured, %d nearby"), (int)core::NativeWorldObjectCount(), (int)nearby.size());
+        core::NativeWorldObject selectedStorage{};
+        const bool haveSelected = g_nativeWorldSelected && core::FindNativeWorldObject(g_nativeWorldSelected, &selectedStorage);
+        const core::NativeWorldObject* selected = haveSelected ? &selectedStorage : nullptr;
+        if (selected) {
+            ImGui::Separator();
+            ImGui::TextWrapped("%s", selected->prefab.c_str());
+            ImGui::TextDisabled("%s", selected->overridden ? T("World override (saved)") : T("Original game object"));
+            if (g_nativeEditHandle != selected->handle) {
+                g_nativeEditHandle = selected->handle;
+                g_nativeEditPos[0] = selected->pos.x; g_nativeEditPos[1] = selected->pos.y; g_nativeEditPos[2] = selected->pos.z;
+                g_nativeEditRot[0] = selected->rot.yaw; g_nativeEditRot[1] = selected->rot.pitch; g_nativeEditRot[2] = selected->rot.roll;
+                g_nativeEditScale = selected->scale;
+            }
+            DragFloat3Edit(T("position"), g_nativeEditPos, 0.05f, -100000, 100000, "%.3f");
+            DragFloat3Edit(T("yaw / pitch / roll"), g_nativeEditRot, 0.5f, -180, 180, "%.1f");
+            DragFloatEdit(T("scale"), &g_nativeEditScale, 0.01f, 0.01f, 100.0f, "%.2f");
+            if (ImGui::Button(T("Apply world edit"))) core::MoveNativeWorldObject(selected->handle,
+                { g_nativeEditPos[0], g_nativeEditPos[1], g_nativeEditPos[2] },
+                { g_nativeEditRot[0], g_nativeEditRot[1], g_nativeEditRot[2] }, g_nativeEditScale);
+            ImGui::SameLine(); if (ImGui::Button(T("Delete"))) core::DeleteNativeWorldObject(selected->handle, true);
+            if (selected->overridden) { ImGui::SameLine(); if (ImGui::Button(T("Restore original"))) core::ResetNativeWorldObject(selected->handle); }
+            const int index = IndexOfPrefab(selected->prefab);
+            if (index >= 0) { ImGui::SameLine(); if (ImGui::Button(T(core::IsFavorite(index) ? "remove favorite" : "add favorite"))) core::ToggleFavorite(index); }
+            ImGui::BeginDisabled(!core::TravelAvailable());
+            if (ImGui::Button(T("Travel here"))) TravelGo(selected->pos, ShortName(selected->prefab).c_str());
+            ImGui::EndDisabled();
+        }
+        ImGui::Separator();
+        ImGui::BeginChild("world_objects", ImVec2(0, 0), ImGuiChildFlags_Borders);
+        const size_t limit = std::min<size_t>(nearby.size(), 300);
+        for (size_t i = 0; i < limit; ++i) {
+            const auto& n = nearby[i]; ImGui::PushID((void*)n.handle);
+            std::string label = ShortName(n.prefab);
+            if (n.overridden) label += n.deleted ? "  [World override: deleted]" : "  [World override]";
+            if (ImGui::Selectable(label.c_str(), n.handle == g_nativeWorldSelected)) SelectNativeWorldObject(n.handle);
+            ImGui::SameLine(); ImGui::TextDisabled("%.0f m", hypotf(n.pos.x - player.world.x, n.pos.z - player.world.z));
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
     }
     static void DrawDockPlacementControls(const PosInfo& p, bool havePos, float ui) {
         if (g_selPrefab < 0 || g_selPrefab >= (int)core::PrefabIndex().size()) { ImGui::TextDisabled(T("pick a card, then PLACE")); return; }
@@ -5260,6 +5527,7 @@ namespace editor {
         static const DockPage dockPages[] = {
             { TabBrowser, ICON_MAGNIFYING_GLASS " Browser" },
             { TabScene, ICON_CUBE " Scene" },
+            { TabWorld, ICON_LOCATION_CROSSHAIRS " World" },
             { TabTerrain, ICON_CUBE " Terrain" },
             { TabNpcs, ICON_LOCATION_DOT " NPCs" },
             { TabBlueprint, ICON_CUBE " Blueprints" },
@@ -5283,11 +5551,12 @@ namespace editor {
             const int gp = core::GimmickPending();
             if (gp > 0) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), core::GimmickTemplateReady() ? T("%d interactive object(s) spawning...") : T("%d interactive object(s) waiting for a spawn template: walk a few meters"), gp);
             DrawScene(p, havePos, true);
-            ProcessBrowserDrag();
+            ProcessSceneDrag();
             ImGui::End();
             if (playAlpha) ImGui::PopStyleVar();
             return;
         }
+        if (g_compactPage == TabWorld) { DrawWorld(p, havePos); ImGui::End(); if (playAlpha) ImGui::PopStyleVar(); return; }
         if (g_compactPage == TabProject) {
             if (g_previewShown) { core::PreviewClear(); g_previewShown = false; }
             DrawProject();
@@ -5521,6 +5790,7 @@ namespace editor {
             const MainNavPage pages[] = {
                 { TabBrowser, ICON_MAGNIFYING_GLASS " Browser", true },
                 { TabScene, ICON_CUBE " Scene", true },
+                { TabWorld, ICON_LOCATION_CROSSHAIRS " World", true },
                 { TabTerrain, ICON_CUBE " Terrain", core::TerrainAvailable() },
                 { TabNpcs, ICON_LOCATION_DOT " NPCs", true },
                 { TabBlueprint, ICON_CUBE " Blueprints", true },
@@ -5565,6 +5835,7 @@ namespace editor {
                 if (gp > 0) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), core::GimmickTemplateReady() ? T("%d interactive object(s) spawning...") : T("%d interactive object(s) waiting for a spawn template: walk a few meters"), gp);
                 DrawScene(p, havePos);
             }
+            else if (g_mainTab == TabWorld) DrawWorld(p, havePos);
             else if (g_mainTab == TabEnvironment) DrawEnvironment();
             else if (g_mainTab == TabHistory) DrawHistory();
             else if (g_mainTab == TabProject) DrawProject();
@@ -5710,6 +5981,7 @@ namespace editor {
         }
         ProcessBrowserDrag();
         ProcessNpcDrag();
+        ProcessSceneDrag();
         ProcessBlueprintDrag();
         DrawMetadataPopups();
         ImGui::End();

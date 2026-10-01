@@ -27,7 +27,7 @@ struct SpawnedObj { uintptr_t obj; std::string prefab; Vec3 pos; Rot rot; float 
                                                        // replaced (restore, re-create) or invalidated (hide/forget) so that engine work queued for an older incarnation can
                                                        // never attach to a newer one; the record keeps its uid, project, group and pose across all of them.
 struct ManagedNpc { int uid = 0; uint32_t key = 0; Vec3 pos{}; int type = 1; uint32_t extra = 0; uintptr_t actor = 0; uint32_t actorId = 0;
-                    uintptr_t transform = 0; DWORD spawnRequestTick = 0; bool bindTimeoutLogged = false; bool editMoving = false; Vec3 liveMoveTarget{}; Vec3 editMoveStart{}; bool liveMovePending = false;   // runtime-only live binding/edit state; not serialized
+                    uintptr_t transform = 0; DWORD spawnRequestTick = 0, nextSpawnTick = 0; uint8_t missingAudits = 0, farAudits = 0; bool bindTimeoutLogged = false; bool editMoving = false; Vec3 liveMoveTarget{}; Vec3 editMoveStart{}; bool liveMovePending = false;   // runtime-only live binding/edit state; not serialized
                     bool aiEnabled = true; bool aiApplied = true; int behavior = 0; bool hidden = false; bool spawnPending = false; DWORD tick = 0;
                     int group = 0; int proj = 0; std::string label, note; uint64_t gen = 0; };
 
@@ -92,7 +92,7 @@ namespace core {
     bool TerrainApply(Vec3 back);        // fast travel 5 km away and back to 'back': the edited tiles stream again (async)
     std::string TerrainApplyState();     // "" when idle
     int TerrainPreviewGen();             // changes whenever the preview heights change
-    bool TerrainTilePreview(int tx, int tz, int project, int dim, std::vector<float>* delta); // downsampled edited-minus-original heights
+    bool TerrainTilePreview(int tx, int tz, int project, int dim, std::vector<float>* delta, std::vector<float>* heights = nullptr); // downsampled change and edited surface
     bool TerrainPreviewGrid(float x0, float z0, int nx, int nz, std::vector<float>* orig, std::vector<float>* edit);   // 2 m texel grid, NaN = not loaded
     // Travel (travel.cpp): the game's own fast travel to any position (loading screen; the world streams at the destination).
     bool TravelAvailable(); bool TravelPrepared(); void TravelPrepare(); std::string TravelStatus();
@@ -133,6 +133,7 @@ namespace core {
     enum class GroundProbeStatus { Pending, Hit, Miss, Invalidated, Unknown };
     GroundProbeStatus GroundResultState(int ticket, GroundHit* out);
     bool GroundResult(int ticket, GroundHit* out); // legacy: true only for Hit/Miss; raw UI consumers must use GroundResultState
+    int TerrainQueryHeight(float x, float z, float* height); // 1 = sampled, 0 = loading, -1 = no terrain tile
     bool GroundGrid(float x0, float z0, int nx, int nz, float step, float top, float len, std::vector<float>* out);   // research: collision heights on a grid (NAN = none)   // true once the ticket finished (poll every frame)
     extern float g_probeRadius;                // sphere radius of the template, calibrated at the player's feet (ground = centerY - radius)
 
@@ -168,6 +169,18 @@ namespace core {
     void SetManagedNpcLabel(int uid, const std::string& label);
     int  NpcState();                                  // 0 = not available in this game build, 1 = walk a few steps first (player actor unknown), 2 = ready
     bool NpcAiControlAvailable();                      // native NPC AI termination control resolved
+    struct NativeWorldObject {
+        uintptr_t handle = 0; std::string prefab; Vec3 source{}, pos{}; Rot sourceRot{}, rot{}; float sourceScale = 1.0f, scale = 1.0f;
+        bool overridden = false, deleted = false;
+    };
+    std::vector<NativeWorldObject> NativeWorldObjects();
+    void NativeWorldObjectsNear(Vec3 center, float halfExtent, std::vector<NativeWorldObject>& out);
+    bool FindNativeWorldObject(uintptr_t handle, NativeWorldObject* out);
+    size_t NativeWorldObjectCount();
+    std::vector<NativeWorldObject> NativeWorldOverrides();
+    bool MoveNativeWorldObject(uintptr_t handle, Vec3 pos, Rot rot, float scale);
+    bool DeleteNativeWorldObject(uintptr_t handle, bool deleted);
+    bool ResetNativeWorldObject(uintptr_t handle);
 #ifdef WB_UNIFIED_HOST_TEST
     // Native boundaries only; registry, generation, desired AI state, queues and persistence remain production.
     struct ManagedNpcNativeTest {

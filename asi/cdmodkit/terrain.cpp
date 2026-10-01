@@ -492,7 +492,7 @@ bool TerrainApply(Vec3 back) {
 }
 
 int TerrainPreviewGen() { std::lock_guard<std::mutex> l(g_mx); return g_gen; }
-bool TerrainTilePreview(int tx, int tz, int project, int dim, std::vector<float>* delta) {
+bool TerrainTilePreview(int tx, int tz, int project, int dim, std::vector<float>* delta, std::vector<float>* heights) {
     if (!delta || dim < 1 || dim > 64) return false;
     std::lock_guard<std::mutex> l(g_mx);
     const auto it = g_cpu.find({ tx, tz });
@@ -502,13 +502,18 @@ bool TerrainTilePreview(int tx, int tz, int project, int dim, std::vector<float>
     for (const auto& stroke : g_strokes)
         if (stroke.proj == project && StrokeTouchesTile(stroke, tx, tz)) ApplyStrokeCpu(edited, tx, tz, stroke);
     delta->assign((size_t)dim * dim, 0.0f);
+    if (heights) heights->assign((size_t)dim * dim, 0.0f);
+    std::vector<unsigned> counts;
+    if (heights) counts.assign((size_t)dim * dim, 0);
     for (int row = 0; row < kTile; ++row) for (int col = 0; col < kTile; ++col) {
         const size_t sample = (size_t)row * kTile + col;
         const int x = col * dim / kTile, y = (kTile - 1 - row) * dim / kTile;
         float& cell = (*delta)[(size_t)y * dim + x];
         const float change = edited[sample] - original[sample];
         if (std::fabs(change) > std::fabs(cell)) cell = change;
+        if (heights) { (*heights)[(size_t)y * dim + x] += edited[sample]; ++counts[(size_t)y * dim + x]; }
     }
+    if (heights) for (size_t i = 0; i < heights->size(); ++i) if (counts[i]) (*heights)[i] /= counts[i];
     return true;
 }
 // Heights on the 2 m texel grid for the preview: sample (i, j) is the texel containing (x0 + 2i, z0 + 2j); NaN where the tile's
@@ -526,6 +531,65 @@ bool TerrainPreviewGrid(float x0, float z0, int nx, int nz, std::vector<float>* 
         const size_t k = (size_t)r * kTile + c; (*orig)[(size_t)j * nx + i] = it->second.orig[k]; (*edit)[(size_t)j * nx + i] = it->second.edit[k]; any = true;
     }
     return any;
+}
+// Height textures are available outside the streamed Havok world. This is the ground-only fallback for editor
+// placement when a physical cast misses; bridges and other collision geometry still come from the physical cast.
+struct QueryHeightTile { int state = 0; float range = 0, offset = 0; std::vector<uint16_t> samples; };
+static std::mutex g_queryHeightMx;
+static std::map<std::pair<int, int>, QueryHeightTile> g_queryHeights;
+static float SampleHeightGrid(const float* grid, float x, float z, int tx, int tz) {
+    const float cx = std::clamp((x - tx * 1024.0f - 1.0f) * 0.5f, 0.0f, 511.0f);
+    const float cz = std::clamp((z - tz * 1024.0f - 1.0f) * 0.5f, 0.0f, 511.0f);
+    const int x0 = (int)cx, z0 = (int)cz, x1 = std::min(x0 + 1, 511), z1 = std::min(z0 + 1, 511);
+    const float ax = cx - x0, az = cz - z0;
+    auto at = [&](int c, int j) { return grid[(size_t)(511 - j) * 512 + c]; };
+    return (at(x0, z0) * (1 - ax) + at(x1, z0) * ax) * (1 - az)
+         + (at(x0, z1) * (1 - ax) + at(x1, z1) * ax) * az;
+}
+int TerrainQueryHeight(float x, float z, float* height) {
+    if (!height || !std::isfinite(x) || !std::isfinite(z)) return -1;
+    const int tx = (int)std::floor(x / 1024.0f), tz = (int)std::floor(z / 1024.0f);
+    const auto key = std::make_pair(tx, tz);
+    { std::lock_guard<std::mutex> l(g_mx);
+      auto it = g_cpu.find(key);
+      if (it != g_cpu.end() && it->second.ok && it->second.edit.size() == (size_t)kTile * kTile) {
+          *height = SampleHeightGrid(it->second.edit.data(), x, z, tx, tz); return 1;
+      }
+    }
+    { std::lock_guard<std::mutex> l(g_queryHeightMx);
+      auto it = g_queryHeights.find(key);
+      if (it != g_queryHeights.end()) {
+          if (it->second.state < 0) return -1;
+          if (it->second.state == 0) return 0;
+          const auto& t = it->second;
+          // Convert only four texels; the cache stores the compact original 16-bit texture.
+          const float cx = std::clamp((x - tx * 1024.0f - 1.0f) * 0.5f, 0.0f, 511.0f);
+          const float cz = std::clamp((z - tz * 1024.0f - 1.0f) * 0.5f, 0.0f, 511.0f);
+          const int x0 = (int)cx, z0 = (int)cz, x1 = std::min(x0 + 1, 511), z1 = std::min(z0 + 1, 511);
+          const float ax = cx - x0, az = cz - z0;
+          auto at = [&](int c, int j) { return t.offset + t.samples[(size_t)(511 - j) * 512 + c] * (t.range / 65535.0f); };
+          *height = (at(x0, z0) * (1 - ax) + at(x1, z0) * ax) * (1 - az)
+                  + (at(x0, z1) * (1 - ax) + at(x1, z1) * ax) * az;
+          return 1;
+      }
+      g_queryHeights.emplace(key, QueryHeightTile{});
+    }
+    std::thread([key, tx, tz]() {
+        QueryHeightTile tile;
+        if (GameReadAvailable() && TileRange(tx, tz, &tile.range, &tile.offset)) {
+            char path[128]; snprintf(path, sizeof path, "leveldata/rootlevel/terrain/height16f/terrain_%d_%d_height_h.dds", tx, tz);
+            std::vector<uint8_t> dds;
+            if (GameReadFile(path, dds) && dds.size() >= kHeader + (size_t)kTile * kTile * 2) {
+                tile.samples.resize((size_t)kTile * kTile);
+                memcpy(tile.samples.data(), dds.data() + kHeader, tile.samples.size() * sizeof(uint16_t));
+                tile.state = 1;
+            }
+        }
+        if (tile.state != 1) tile.state = -1;
+        std::lock_guard<std::mutex> l(g_queryHeightMx);
+        g_queryHeights[key] = std::move(tile);
+    }).detach();
+    return 0;
 }
 std::string TerrainStatus() {
     std::lock_guard<std::mutex> l(g_mx); char b[200];

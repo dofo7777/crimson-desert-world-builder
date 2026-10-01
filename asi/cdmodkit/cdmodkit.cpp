@@ -4,6 +4,7 @@
 #include "core.h"
 #include "i18n.h"
 #include <cstdio>
+#include <io.h>
 #include <cmath>
 #include <deque>
 #include <mutex>
@@ -364,6 +365,13 @@ static uintptr_t g_lastGameObj = 0;         // last SceneObject the game itself 
 static int  g_createLogged = 0;
 static bool g_inOurSpawn = false;
 static void* g_lastMgr = nullptr;
+static std::mutex g_nativeWorldMutex;
+static std::map<uintptr_t, NativeWorldObject> g_nativeWorld;
+static std::vector<NativeWorldObject> g_nativeOverrides;
+static std::atomic<bool> g_nativeHasOverrides{ false };
+static thread_local bool t_nativeApplying = false;
+static void NativeWorldCreated(uintptr_t handle, const std::string& prefab, const float* transform);
+static void LoadNativeWorldOverrides();
 
 static void NameGimmickCapture(const std::string& prefab, float x, float y, float z);
 extern uintptr_t kRva_GimmickSpawn_;
@@ -387,6 +395,10 @@ static void* __fastcall HookCreate(void* mgr, void* tag, void* b, void* c, void*
     uintptr_t retAddr = (uintptr_t)_ReturnAddress();
     void* r = g_origCreate(mgr, tag, b, c, d, transform, f1, f2, f3);
     if (!g_inOurSpawn && r) g_lastGameObj = (uintptr_t)r;
+    if (!g_inOurSpawn && r) {
+        float nativeXf[10] = {};
+        if (ReadBytes((uintptr_t)transform, nativeXf, sizeof nativeXf)) NativeWorldCreated((uintptr_t)r, PrefabPathText((uintptr_t)d), nativeXf);
+    }
     if (!g_inOurSpawn && r && kRva_GimmickSpawn_) { float t[10] = {0}; if (ReadBytes((uintptr_t)transform, t, 40)) NameGimmickCapture(PrefabPathText((uintptr_t)d), t[7], t[8], t[9]); }
     if (log) {
         float t[10] = {0}; ReadBytes((uintptr_t)transform, t, 40);
@@ -748,6 +760,155 @@ static bool DoMoveInPlace(uintptr_t obj, Vec3 pos, Rot rot, float scale) {
     return true; // native transform is void: completion, not mere queue admission
 #endif
 }
+static std::string NativeOverridePath() { return g_modDir + "\\world_overrides.tsv"; }
+static int NativeOverrideIndexLocked(const NativeWorldObject& item) {
+    for (int i = 0; i < (int)g_nativeOverrides.size(); ++i) {
+        const auto& saved = g_nativeOverrides[i];
+        if (saved.prefab == item.prefab && fabsf(saved.source.x - item.source.x) < 0.25f &&
+            fabsf(saved.source.y - item.source.y) < 0.25f && fabsf(saved.source.z - item.source.z) < 0.25f &&
+            fabsf(saved.sourceScale - item.sourceScale) < 0.05f) return i;
+    }
+    return -1;
+}
+static bool SaveNativeWorldOverridesLocked() {
+    const std::string path = NativeOverridePath(), temp = path + ".tmp";
+    FILE* f = fopen(temp.c_str(), "wb"); if (!f) return false;
+    fputs("# World Builder native object overrides v2\n", f);
+    for (const auto& n : g_nativeOverrides) {
+        if (!n.overridden || n.prefab.find('\t') != std::string::npos) continue;
+        fprintf(f, "%s\t%.9g\t%.9g\t%.9g\t%.9g\t%.9g\t%.9g\t%.9g\t%.9g\t%.9g\t%.9g\t%.9g\t%d\n",
+            n.prefab.c_str(), n.source.x, n.source.y, n.source.z, n.sourceScale,
+            n.pos.x, n.pos.y, n.pos.z, n.scale, n.rot.yaw, n.rot.pitch, n.rot.roll, n.deleted ? 1 : 0);
+    }
+    const bool flushed = fflush(f) == 0, synced = flushed && _commit(_fileno(f)) == 0;
+    const bool written = fclose(f) == 0 && synced;
+    if (!written) { DeleteFileA(temp.c_str()); return false; }
+    if (!MoveFileExA(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { DeleteFileA(temp.c_str()); return false; }
+    return true;
+}
+static void LoadNativeWorldOverrides() {
+    FILE* f = fopen(NativeOverridePath().c_str(), "rb"); if (!f) return;
+    char line[1024]; std::vector<NativeWorldObject> loaded;
+    while (fgets(line, sizeof line, f) && loaded.size() < 20000) {
+        if (line[0] == '#') continue;
+        char path[512] = {}; NativeWorldObject n; int deleted = 0;
+        if (sscanf(line, "%511[^\t]\t%f\t%f\t%f\t%f\t%f\t%f\t%f\t%f\t%f\t%f\t%f\t%d",
+            path, &n.source.x, &n.source.y, &n.source.z, &n.sourceScale, &n.pos.x, &n.pos.y, &n.pos.z,
+            &n.scale, &n.rot.yaw, &n.rot.pitch, &n.rot.roll, &deleted) != 13) continue;
+        if (strncmp(path, "/object/", 8) != 0 || !std::isfinite(n.pos.x) || !std::isfinite(n.pos.y) ||
+            !std::isfinite(n.pos.z) || n.scale <= 0 || n.scale > 100) continue;
+        n.prefab = path; n.overridden = true; n.deleted = deleted != 0; loaded.push_back(std::move(n));
+    }
+    fclose(f);
+    std::lock_guard<std::mutex> l(g_nativeWorldMutex); g_nativeOverrides = std::move(loaded);
+    g_nativeHasOverrides = !g_nativeOverrides.empty();
+    Log("[world] loaded %zu native object overrides", g_nativeOverrides.size());
+}
+static Rot RotFromNativeQuat(const float* q) {
+    const float x = q[3], y = q[4], z = q[5], w = q[6], rad = 180.0f / 3.14159265f;
+    return { atan2f(2 * (x * z + y * w), 1 - 2 * (x * x + y * y)) * rad,
+        asinf(std::clamp(2 * (x * w - y * z), -1.0f, 1.0f)) * rad,
+        atan2f(2 * (x * y + z * w), 1 - 2 * (x * x + z * z)) * rad };
+}
+static void NativeWorldCreated(uintptr_t handle, const std::string& prefab, const float* xf) {
+    if (!handle || prefab.rfind("/object/", 0) != 0 || !std::isfinite(xf[7]) || !std::isfinite(xf[8]) ||
+        !std::isfinite(xf[9]) || !std::isfinite(xf[0]) || xf[0] <= 0) return;
+    NativeWorldObject n; n.handle = handle; n.prefab = prefab; n.source = n.pos = { xf[7], xf[8], xf[9] };
+    n.sourceScale = n.scale = xf[0]; n.sourceRot = n.rot = RotFromNativeQuat(xf);
+    bool apply = false;
+    {
+        std::lock_guard<std::mutex> l(g_nativeWorldMutex);
+        const int i = NativeOverrideIndexLocked(n);
+        if (i >= 0) { auto& saved = g_nativeOverrides[i]; n.pos = saved.pos; n.rot = saved.rot; n.scale = saved.scale;
+            n.deleted = saved.deleted; n.overridden = apply = true; saved.handle = handle; }
+        g_nativeWorld[handle] = n;
+        if (g_nativeWorld.size() > 8192) for (auto it = g_nativeWorld.begin(); it != g_nativeWorld.end(); ++it)
+            if (!it->second.overridden && it->first != handle) { g_nativeWorld.erase(it); break; }
+    }
+    if (apply) RunOnGameThread([handle]() {
+        NativeWorldObject n;
+        { std::lock_guard<std::mutex> l(g_nativeWorldMutex); auto it = g_nativeWorld.find(handle);
+          if (it == g_nativeWorld.end() || !it->second.overridden) return; n = it->second; }
+        if (!CheckSO(handle, "world override")) return;
+        t_nativeApplying = true;
+        if (n.deleted) DoRemove(handle); else DoMoveInPlace(handle, n.pos, n.rot, n.scale);
+        t_nativeApplying = false;
+    });
+}
+std::vector<NativeWorldObject> NativeWorldObjects() {
+    std::lock_guard<std::mutex> l(g_nativeWorldMutex);
+    std::vector<NativeWorldObject> items; items.reserve(g_nativeWorld.size());
+    for (const auto& pair : g_nativeWorld) items.push_back(pair.second);
+    return items;
+}
+void NativeWorldObjectsNear(Vec3 center, float halfExtent, std::vector<NativeWorldObject>& out) {
+    if (!std::isfinite(center.x) || !std::isfinite(center.z) || !std::isfinite(halfExtent) || halfExtent < 0) {
+        out.clear();
+        return;
+    }
+    if (out.capacity() < 512) out.reserve(512);
+    std::lock_guard<std::mutex> l(g_nativeWorldMutex);
+    size_t count = 0;
+    for (const auto& pair : g_nativeWorld) {
+        const auto& item = pair.second;
+        if (fabsf(item.pos.x - center.x) > halfExtent || fabsf(item.pos.z - center.z) > halfExtent) continue;
+        if (count < out.size()) out[count] = item;
+        else out.push_back(item);
+        ++count;
+    }
+    out.resize(count);
+}
+bool FindNativeWorldObject(uintptr_t handle, NativeWorldObject* out) {
+    if (!handle || !out) return false;
+    std::lock_guard<std::mutex> l(g_nativeWorldMutex);
+    const auto it = g_nativeWorld.find(handle);
+    if (it == g_nativeWorld.end()) return false;
+    *out = it->second;
+    return true;
+}
+size_t NativeWorldObjectCount() {
+    std::lock_guard<std::mutex> l(g_nativeWorldMutex);
+    return g_nativeWorld.size();
+}
+std::vector<NativeWorldObject> NativeWorldOverrides() {
+    std::lock_guard<std::mutex> l(g_nativeWorldMutex); return g_nativeOverrides;
+}
+static bool NativeWorldEdit(uintptr_t handle, Vec3 pos, Rot rot, float scale, int action) {
+    if (!GameThreadReady() || !handle || !std::isfinite(pos.x) || !std::isfinite(pos.y) || !std::isfinite(pos.z) ||
+        !std::isfinite(scale) || scale <= 0 || scale > 100) return false;
+    { std::lock_guard<std::mutex> l(g_nativeWorldMutex); if (!g_nativeWorld.count(handle)) return false; }
+    RunOnGameThread([handle, pos, rot, scale, action]() {
+        NativeWorldObject before;
+        { std::lock_guard<std::mutex> l(g_nativeWorldMutex); auto it = g_nativeWorld.find(handle);
+          if (it == g_nativeWorld.end()) return; before = it->second; }
+        if (!CheckSO(handle, "world edit")) return;
+        t_nativeApplying = true;
+        bool ok = action == 1 ? DoRemove(handle) : action == 2 ? DoMoveInPlace(handle, before.source, before.sourceRot, before.sourceScale)
+            : DoMoveInPlace(handle, pos, rot, scale);
+        if (action == 2 && ok) ((SetEnableFn)(g_base + kRva_SetEnable))((void*)handle, 1);
+        t_nativeApplying = false;
+        if (!ok) return;
+        std::lock_guard<std::mutex> l(g_nativeWorldMutex);
+        auto it = g_nativeWorld.find(handle); if (it == g_nativeWorld.end() || it->second.prefab != before.prefab ||
+            it->second.source.x != before.source.x || it->second.source.z != before.source.z) return;
+        auto& n = it->second;
+        if (action == 2) { n = before; n.pos = n.source; n.overridden = n.deleted = false; }
+        else { if (action == 0) { n.pos = pos; n.rot = rot; n.scale = scale; n.deleted = false; }
+               else n.deleted = true; n.overridden = true; }
+        const int index = NativeOverrideIndexLocked(before);
+        if (action == 2) { if (index >= 0) g_nativeOverrides.erase(g_nativeOverrides.begin() + index); }
+        else if (index >= 0) g_nativeOverrides[index] = n; else g_nativeOverrides.push_back(n);
+        g_nativeHasOverrides = !g_nativeOverrides.empty();
+        if (!SaveNativeWorldOverridesLocked()) Log("[world] failed to save native object override %s", n.prefab.c_str());
+    });
+    return true;
+}
+bool MoveNativeWorldObject(uintptr_t handle, Vec3 pos, Rot rot, float scale) { return NativeWorldEdit(handle, pos, rot, scale, 0); }
+bool DeleteNativeWorldObject(uintptr_t handle, bool deleted) {
+    if (!deleted) return ResetNativeWorldObject(handle);
+    return NativeWorldEdit(handle, {}, {}, 1.0f, 1);
+}
+bool ResetNativeWorldObject(uintptr_t handle) { return NativeWorldEdit(handle, {}, {}, 1.0f, 2); }
 extern volatile LONG g_queueCount;
 
 // ---- reading pack files through the game's own resource loader (no decryption in the mod) ----
@@ -912,6 +1073,13 @@ static float g_fcSoLast[11] = {}; static volatile bool g_fcSoSeen = false;   // 
 static volatile uintptr_t g_fcSceneObj = 0;   // the camera scene object while the free camera is on (set once per frame by the pose hook)
 static bool FreeCamSceneXf(const float* in, float* out);   // free camera section below
 static void __fastcall HookSetXf(void* obj, const float* xf, uint8_t a, uint8_t b) {
+    if (!t_nativeApplying && g_nativeHasOverrides.load(std::memory_order_relaxed)) {
+        NativeWorldObject n; bool match = false;
+        { std::lock_guard<std::mutex> l(g_nativeWorldMutex); auto it = g_nativeWorld.find((uintptr_t)obj);
+          if (it != g_nativeWorld.end() && it->second.overridden && !it->second.deleted) { n = it->second; match = true; } }
+        if (match) { alignas(16) float target[12]; MakeTransform(target, n.pos, n.rot, n.scale);
+            g_origSetXf(obj, target, a, b); return; }
+    }
     // the camera manager holds the scene object 0x28 into it (a base subobject); setWorldTransform gets the object itself
     if (g_fcSceneObj && ((uintptr_t)obj == g_fcSceneObj - 0x28 || (uintptr_t)obj == g_fcSceneObj) && xf) {   // the game camera moves its scene object every frame: culling, LOD and sound follow it
         alignas(16) float t[12]; if (FreeCamSceneXf(xf, t)) { g_origSetXf(obj, t, a, b); return; }
@@ -926,6 +1094,10 @@ static void __fastcall HookSetXf(void* obj, const float* xf, uint8_t a, uint8_t 
     g_origSetXf(obj, xf, a, b);
 }
 static void __fastcall HookSetEnable(void* obj, uint8_t enable) {
+    if (enable && !t_nativeApplying && g_nativeHasOverrides.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> l(g_nativeWorldMutex); auto it = g_nativeWorld.find((uintptr_t)obj);
+        if (it != g_nativeWorld.end() && it->second.overridden && it->second.deleted) enable = 0;
+    }
     uintptr_t ret = (uintptr_t)_ReturnAddress();
     if (g_trace && InImage(ret)) {
         g_traceCallers[(ret - g_base) | 0x8000000000000000ull]++;
@@ -3325,12 +3497,12 @@ static void* __fastcall HookCastShape(void* ctx, void* world, void* query, void*
 // sphere shape) and replayed with our own start point and a downward displacement. Console "probe", button in the Log tab.
 // the collector object is at least 0x120 bytes (addHit copies 0xA0 bytes to +0x80) and the query at least 0xC0 (the inner code reads
 // +0x8E/+0x90/+0xB8): the copies are generous, a too small collector copy let the game write past our buffer and crash on return
-struct CastTemplate { bool have = false; void* world = nullptr; uint8_t query[0x200], xform[0x100], collector[0x200], hits[0x100], shape[0x200]; uintptr_t collAddr = 0, hitsAddr = 0, shapeAddr = 0; };
+struct CastTemplate { bool have = false; void* world = nullptr; uint8_t query[0x200], xform[0x100], collector[0x200], hits[0x100], shape[0x200]; uintptr_t collAddr = 0, hitsAddr = 0, shapeAddr = 0; float originX = 0, originZ = 0; };
 static CastTemplate g_tpl;
 static std::mutex g_tplMutex;
 float g_probeRadius = 0.0f; static bool g_probeCalibrated = false; // protected by g_tplMutex
 struct GroundReq { int id; Vec3 start; float len; bool verbose; uint64_t epoch; std::weak_ptr<GroundOp> op; bool owned = false; Vec3 dir{ 0, -1, 0 }; bool robust = false; };
-struct GroundStored { GroundHit hit; uint64_t epoch; std::weak_ptr<GroundOp> op; bool owned; GroundProbeStatus status = GroundProbeStatus::Pending; };
+struct GroundStored { GroundHit hit; uint64_t epoch; std::weak_ptr<GroundOp> op; bool owned; GroundProbeStatus status = GroundProbeStatus::Pending; Vec3 start{}; float len = 0; bool terrainFallback = false; };
 static std::mutex g_groundMutex; static std::vector<GroundReq> g_groundQueue; static std::map<int, GroundStored> g_groundResults; static int g_groundNext = 0;
 static volatile LONG g_groundQueued = 0;
 static void PruneGroundTickets() {
@@ -3353,11 +3525,15 @@ static void PruneGroundTickets() {
 }
 static void ServiceGroundQueue(void* world);
 static void CaptureTemplate(void* world, void* q, void* xf, void* col) {
-    { std::lock_guard<std::mutex> lock(g_tplMutex); if (g_tpl.have && g_tpl.world == world) return; }
+    // Recheck an existing world's origin periodically; the common hook path must stay cheap.
+    static std::atomic<unsigned> s_recheck{ 0 };
+    { std::lock_guard<std::mutex> lock(g_tplMutex);
+      if (g_tpl.have && g_tpl.world == world && (s_recheck.fetch_add(1, std::memory_order_relaxed) & 63u) != 0) return; }
     uintptr_t hits = 0, shape = 0; ReadBytes((uintptr_t)col + 0x20, &hits, 8); ReadBytes((uintptr_t)q + 0x28, &shape, 8);
     if (!hits || !shape) return;
     { const char* sn = RttiName(shape); if (!sn || !strstr(sn, "hknpSphereShape")) return; }   // the character's ground probe uses a small sphere
     if (hits != (uintptr_t)col + 0x30) return;                                                   // inline hit buffer, as in the captured layout
+    float originX = 0, originZ = 0;
     {   // only the character's own probe: query start (tile-local) within 3 m of the player. Other sphere casts (camera, cinematics,
         // loading) use other collectors / contexts and replaying those froze or crashed the game.
         PosInfo pi{}; if (!PlayerPosInfo(&pi)) return;
@@ -3365,6 +3541,9 @@ static void CaptureTemplate(void* world, void* q, void* xf, void* col) {
         const float dx = qs[0] - pi.tiled.x, dz = qs[2] - pi.tiled.z, dy = qs[1] - pi.tiled.y;
         if (dx * dx + dz * dz > 9.0f || fabsf(dy) > 3.0f) return;
         if (fabsf(pi.world.x) < 1.0f && fabsf(pi.world.z) < 1.0f) return;   // (0, 1000, 0) is the placeholder while loading
+        originX = pi.world.x - qs[0]; originZ = pi.world.z - qs[2];
+        { std::lock_guard<std::mutex> lock(g_tplMutex);
+          if (g_tpl.have && g_tpl.world == world && fabsf(g_tpl.originX - originX) < 1.0f && fabsf(g_tpl.originZ - originZ) < 1.0f) return; }
         uintptr_t vt = 0; ReadBytes((uintptr_t)col, &vt, 8); if (!InImage(vt)) return;
         // only the collector class whose hit handling was verified (resolved at startup, see ResolveProbeCollectorVtable)
         if (!kRva_ProbeCollector || vt - g_base != kRva_ProbeCollector) {
@@ -3378,11 +3557,13 @@ static void CaptureTemplate(void* world, void* q, void* xf, void* col) {
     if (!ReadBytes((uintptr_t)q, next.query, sizeof next.query) || !ReadBytes((uintptr_t)xf, next.xform, sizeof next.xform) || !ReadBytes((uintptr_t)col, next.collector, sizeof next.collector)
         || !ReadBytes(hits, next.hits, sizeof next.hits) || !ReadBytes(shape, next.shape, sizeof next.shape)) return;
     next.world = world; next.collAddr = (uintptr_t)col; next.hitsAddr = hits; next.shapeAddr = shape; next.have = true;
+    next.originX = originX; next.originZ = originZ;
     { std::lock_guard<std::mutex> operation(g_groundOpMutex); std::lock_guard<std::mutex> lock(g_tplMutex);
-      if (g_tpl.world != world || g_tpl.have) return; // superseded capture; publish only to its observed world
+      if (g_tpl.world != world || (g_tpl.have && fabsf(g_tpl.originX - originX) < 1.0f && fabsf(g_tpl.originZ - originZ) < 1.0f)) return;
+      if (g_tpl.have) GroundEpochLocked(); // a new physics origin invalidates outstanding local-coordinate casts
       g_tpl = next; g_probeCalibrated = false;
     }
-    Log("[probe] template captured: collector %p hits %p (delta 0x%llx) shape %p (%s)", col, (void*)hits, (unsigned long long)(hits - (uintptr_t)col), (void*)shape, RttiName(shape) ? RttiName(shape) : "?");
+    Log("[probe] template captured: origin (%.0f %.0f), collector %p hits %p (delta 0x%llx) shape %p (%s)", originX, originZ, col, (void*)hits, (unsigned long long)(hits - (uintptr_t)col), (void*)shape, RttiName(shape) ? RttiName(shape) : "?");
 }
 static uintptr_t FindPatternCount(const char* pat, int* count);
 
@@ -4875,6 +5056,7 @@ static volatile uintptr_t g_lastSender = 0;   // fast path of the capture: same 
 static void* g_capOrig[2] = {}; static const char* g_capName[2] = { "", "" };
 static void QueuePendingManagedNpcs();
 static void QueueManagedNpcAiReconcile();
+static bool WriteManagedNpcTransformNow(uintptr_t tf, Vec3 world);
 template<int K> static void* __fastcall CapThunk(void* h, void* res, void* pkt, void* d, void* e, void* f, void* g, void* i) {
     uintptr_t s = 0;
     if (pkt && ReadPtr((uintptr_t)pkt, &s) && s && s != g_lastSender) {
@@ -5107,7 +5289,7 @@ static void SyncManagedNpcAiNow(int uid) {
     SetManagedNpcRuntimeAiNow(uid, desired);
 }
 static void ReconcileManagedNpcActors() {
-    static DWORD s_last = 0, s_lastAiAudit = 0; const DWORD now = GetTickCount();
+    static DWORD s_last = 0, s_lastAiAudit = 0, s_lastHoldAudit = 0; const DWORD now = GetTickCount();
     if (now - s_last < 50) return;
     s_last = now;
 
@@ -5135,6 +5317,10 @@ static void ReconcileManagedNpcActors() {
     }
 
     std::vector<int> aiSync;
+    struct FarNpc { int uid; uintptr_t actor; uint64_t gen; Vec3 actual, expected; };
+    std::vector<FarNpc> farNpcs;
+    struct HeldNpc { int uid; uintptr_t actor, transform; uint64_t gen; Vec3 target; };
+    std::vector<HeldNpc> heldNpcs;
     std::vector<std::pair<int, uintptr_t>> cleanup;
     {
         std::lock_guard<std::mutex> l(g_regMutex);
@@ -5143,7 +5329,7 @@ static void ReconcileManagedNpcActors() {
             uintptr_t best = 0; float bestScore = 1e9f;
             for (const auto& r : candidates) {
                 const int dt = (int)(r.tick - it->requestTick);
-                if (dt < -100 || dt > 30000 || g_managedNpcActors.count(r.actor)) continue;
+                if (dt < -100 || dt > 60000 || g_managedNpcActors.count(r.actor)) continue;
                 const float dx = r.pos.x - it->pos.x, dy = r.pos.y - it->pos.y, dz = r.pos.z - it->pos.z;
                 const float d = sqrtf(dx * dx + dy * dy + dz * dz);
                 if (d > 1.5f) continue;
@@ -5154,22 +5340,29 @@ static void ReconcileManagedNpcActors() {
                 g_managedNpcActors.insert(best);
                 cleanup.push_back({ it->uid, best });
                 it = g_pendingNpcCleanup.erase(it);
-            } else if (now - it->requestTick >= 30000) {
-                Log("[npc] deleted managed #%d never resolved its async actor within 30 s", it->uid);
+            } else if (now - it->requestTick >= 60000) {
+                Log("[npc] deleted managed #%d never resolved its async actor within 60 s", it->uid);
                 it = g_pendingNpcCleanup.erase(it);
             } else ++it;
         }
         for (auto& n : g_npcReg) {
             if (n.hidden || n.actor || !n.spawnRequestTick) continue;
             if (now - n.spawnRequestTick >= 30000 && !n.bindTimeoutLogged) {
-                Log("[npc] managed #%d actor not bound after 30 s; spawn request retained to prevent a duplicate", n.uid);
+                Log("[npc] managed #%d actor not bound after 30 s; checking for a late actor before retry", n.uid);
                 n.bindTimeoutLogged = true;
             }
-            if (now - n.spawnRequestTick >= 30000) continue;
+            if (now - n.spawnRequestTick >= 45000) {
+                RememberUnboundNpcCleanupLocked(n);
+                n.nextSpawnTick = n.spawnRequestTick + 60000;
+                n.spawnRequestTick = 0; n.spawnPending = false; n.bindTimeoutLogged = false;
+                n.gen = NewGenLocked();
+                Log("[npc] managed #%d unbound request expired; retry scheduled", n.uid);
+                continue;
+            }
             uintptr_t best = 0, bestTf = 0; float bestScore = 1e9f; Vec3 bestPos{};
             for (const auto& r : candidates) {
                 const int dt = (int)(r.tick - n.spawnRequestTick);
-                if (dt < -100 || dt > 30000 || g_managedNpcActors.count(r.actor)) continue;
+                if (dt < -100 || dt > 45000 || g_managedNpcActors.count(r.actor)) continue;
                 const float dx = r.pos.x - n.pos.x, dy = r.pos.y - n.pos.y, dz = r.pos.z - n.pos.z;
                 const float d = sqrtf(dx * dx + dy * dy + dz * dz);
                 if (d > 30.0f) continue;
@@ -5178,30 +5371,96 @@ static void ReconcileManagedNpcActors() {
             }
             if (!best) continue;
             n.actor = best; n.transform = bestTf; n.actorId = ManagedNpcActorId(best);
-            n.spawnPending = false; n.spawnRequestTick = 0; n.bindTimeoutLogged = false;
-            n.editMoving = false; n.liveMovePending = false; n.aiApplied = true; g_managedNpcActors.insert(best);
+            n.spawnPending = false; n.spawnRequestTick = 0; n.bindTimeoutLogged = false; n.nextSpawnTick = 0; n.missingAudits = n.farAudits = 0;
+            n.editMoving = false; n.liveMovePending = false;
+            bool terminated = false;
+            n.aiApplied = ReadNpcAiTerminated(best, &terminated) ? !terminated : !n.aiEnabled;
+            g_managedNpcActors.insert(best);
             Log("[npc] managed #%d late-bound actor %p (%s) at (%.2f %.2f %.2f), spawn (%.2f %.2f %.2f)",
                 n.uid, (void*)best, RttiName(best) ? RttiName(best) : "?", bestPos.x, bestPos.y, bestPos.z, n.pos.x, n.pos.y, n.pos.z);
-            if (n.aiApplied != n.aiEnabled) aiSync.push_back(n.uid);
+            if (n.aiApplied != n.aiEnabled || !n.aiEnabled) aiSync.push_back(n.uid);
         }
 #ifndef WB_UNIFIED_HOST_TEST
         if (now - s_lastAiAudit >= 1000) {
             s_lastAiAudit = now;
             for (auto& n : g_npcReg) {
                 if (n.hidden || !n.actor || n.editMoving) continue;
+                uintptr_t vt = 0;
+                PosInfo position{};
+                const bool live = ReadPtr(n.actor, &vt) && InImage(vt) && n.transform &&
+                    ReadPtr(n.transform, &vt) && InImage(vt) && ReadTransformPos(n.transform, &position, false);
+                if (!live) {
+                    if (++n.missingAudits >= 3) {
+                        Log("[npc] managed #%d actor %p disappeared; scheduling recreation", n.uid, (void*)n.actor);
+                        g_managedNpcActors.erase(n.actor);
+                        n.actor = n.transform = 0; n.actorId = 0; n.spawnPending = false; n.spawnRequestTick = 0;
+                        n.nextSpawnTick = now + 10000; n.missingAudits = n.farAudits = 0; n.gen = NewGenLocked(); n.aiApplied = true;
+                    }
+                    continue;
+                }
+                n.missingAudits = 0;
+                const float dx = position.world.x - n.pos.x, dy = position.world.y - n.pos.y, dz = position.world.z - n.pos.z;
+                if (dx * dx + dy * dy + dz * dz > 1000000.0f) {
+                    if (n.farAudits < 3 && ++n.farAudits == 3) farNpcs.push_back({ n.uid, n.actor, n.gen, position.world, n.pos });
+                } else n.farAudits = 0;
                 bool terminated = false;
-                if (!ReadNpcAiTerminated(n.actor, &terminated)) continue;
+                if (!ReadNpcAiTerminated(n.actor, &terminated)) {
+                    if (n.aiApplied != n.aiEnabled) aiSync.push_back(n.uid);
+                    continue;
+                }
                 const bool applied = !terminated;
                 if (n.aiApplied != applied) {
                     Log("[npc] managed #%d AI state changed outside editor: enabled=%d, desired=%d", n.uid, applied ? 1 : 0, n.aiEnabled ? 1 : 0);
                     n.aiApplied = applied;
-                    if (applied != n.aiEnabled) aiSync.push_back(n.uid);
                 }
+                if (applied != n.aiEnabled) aiSync.push_back(n.uid);
+            }
+        }
+        if (now - s_lastHoldAudit >= 250) {
+            s_lastHoldAudit = now;
+            for (const auto& n : g_npcReg) {
+                if (n.hidden || !n.actor || !n.transform || n.aiEnabled || n.aiApplied || n.editMoving) continue;
+                PosInfo live{};
+                if (!ReadTransformPos(n.transform, &live, false)) continue;
+                const float dx = live.world.x - n.pos.x, dz = live.world.z - n.pos.z;
+                const float horizontal2 = dx * dx + dz * dz;
+                if (horizontal2 > 0.75f * 0.75f && horizontal2 < 50.0f * 50.0f)
+                    heldNpcs.push_back({ n.uid, n.actor, n.transform, n.gen, { n.pos.x, live.world.y, n.pos.z } });
             }
         }
 #endif
     }
-    for (int uid : aiSync) RunOnServerTick([uid]() { SyncManagedNpcAiNow(uid); });
+    for (int uid : aiSync) RunOnServerTick([uid]() {
+        bool off = false;
+        { std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+          if (i < 0 || g_npcReg[i].hidden || !g_npcReg[i].actor) return; off = !g_npcReg[i].aiEnabled; }
+        if (off) SetManagedNpcRuntimeAiNow(uid, false);
+        else SyncManagedNpcAiNow(uid);
+    });
+    for (const auto& held : heldNpcs) RunOnServerTick([held]() {
+        { std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(held.uid);
+          if (i < 0) return; const auto& n = g_npcReg[i];
+          if (n.hidden || n.actor != held.actor || n.transform != held.transform || n.gen != held.gen || n.aiEnabled || n.editMoving) return; }
+        if (!WriteManagedNpcTransformNow(held.transform, held.target))
+            Log("[npc] managed #%d AI-off position hold could not update TransformSync", held.uid);
+    });
+    for (const auto& distant : farNpcs) RunOnServerTick([distant]() {
+        {
+            std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(distant.uid);
+            if (i < 0 || g_npcReg[i].hidden || g_npcReg[i].actor != distant.actor || g_npcReg[i].gen != distant.gen) return;
+        }
+        Log("[npc] managed #%d relocated far from saved pose: (%.2f %.2f %.2f) vs (%.2f %.2f %.2f)",
+            distant.uid, distant.actual.x, distant.actual.y, distant.actual.z, distant.expected.x, distant.expected.y, distant.expected.z);
+        if (!RemoveSpawnedActor(distant.actor)) {
+            std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(distant.uid);
+            if (i >= 0 && g_npcReg[i].gen == distant.gen) g_npcReg[i].farAudits = 0;
+            return;
+        }
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(distant.uid);
+        if (i < 0 || g_npcReg[i].hidden || g_npcReg[i].actor != distant.actor || g_npcReg[i].gen != distant.gen) return;
+        ManagedNpc& n = g_npcReg[i]; n.actor = n.transform = 0; n.actorId = 0; n.spawnPending = false; n.spawnRequestTick = 0;
+        n.nextSpawnTick = GetTickCount() + 5000; n.farAudits = 0; n.gen = NewGenLocked(); n.aiApplied = true;
+    });
     for (const auto& item : cleanup) RunOnServerTick([uid = item.first, actor = item.second]() {
         Log("[npc] removing late actor %p for deleted managed #%d", (void*)actor, uid);
         if (!RemoveSpawnedActor(actor)) Log("[npc] late actor removal failed for deleted managed #%d", uid);
@@ -5349,7 +5608,7 @@ static void SpawnManagedNpcNow(int uid, uint64_t gen) {
         std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid); if (NpcGenCurrentLocked(uid, gen)) { g_npcReg[i].spawnPending = false; g_npcReg[i].spawnRequestTick = 0; }
         return;
     }
-    bool discard = false, needAiSync = false; uintptr_t staleBoundActor = 0;
+    bool discard = false, needAiSync = false, wantAi = true; uintptr_t staleBoundActor = 0;
     {
         std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
         if (actor) g_managedNpcActors.insert(actor);
@@ -5360,13 +5619,16 @@ static void SpawnManagedNpcNow(int uid, uint64_t gen) {
                 if (actor && live.actor && live.actor != actor) staleBoundActor = live.actor;
                 live.actor = actor; live.actorId = actorId; live.transform = actor ? FindActorTransform(actor) : 0;
                 live.spawnPending = actor == 0;   // asynchronous SpawnCharacter creation is reconciled from recent ServerActor constructors
-                live.editMoving = false; live.liveMovePending = false; live.aiApplied = true;
+                live.editMoving = false; live.liveMovePending = false;
+                bool terminated = false;
+                live.aiApplied = actor && ReadNpcAiTerminated(actor, &terminated) ? !terminated : !live.aiEnabled;
             } else {
                 // UI reconciliation may bind an asynchronous actor before the native spawn request returns.
                 // A zero synchronous capture must not erase that live binding.
                 live.spawnPending = false;
             }
-            needAiSync = live.aiApplied != live.aiEnabled;
+            wantAi = live.aiEnabled;
+            needAiSync = live.aiApplied != live.aiEnabled || (actor && !live.aiEnabled);
         }
     }
     if (discard) { if (actor) RemoveSpawnedActor(actor); return; }
@@ -5375,7 +5637,8 @@ static void SpawnManagedNpcNow(int uid, uint64_t gen) {
         RemoveSpawnedActor(staleBoundActor);
     }
     if (needAiSync) {
-        SyncManagedNpcAiNow(uid);
+        if (!wantAi) SetManagedNpcRuntimeAiNow(uid, false, gen);
+        else SyncManagedNpcAiNow(uid);
         bool stillPending = false; uintptr_t curActor = 0; uint32_t curActorId = 0;
         {
             std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
@@ -5394,7 +5657,7 @@ static bool QueueManagedNpcIfReady(int uid) {
         std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
         if (i >= 0) {
             ManagedNpc& n = g_npcReg[i];
-            if (!n.hidden && !n.actor && !n.spawnPending && !n.spawnRequestTick) { n.spawnPending = true; gen = n.gen; queue = true; }
+            if (!n.hidden && !n.actor && !n.spawnPending && !n.spawnRequestTick && (!n.nextSpawnTick || (int32_t)(GetTickCount() - n.nextSpawnTick) >= 0)) { n.spawnPending = true; gen = n.gen; queue = true; }
         }
     }
     if (queue) RunOnServerTick([uid, gen]() { SpawnManagedNpcNow(uid, gen); });
@@ -5418,7 +5681,7 @@ static void QueuePendingManagedNpcs() {
     std::vector<std::pair<int, uint64_t>> pending;
     {
         std::lock_guard<std::mutex> l(g_regMutex);
-        for (auto& n : g_npcReg) if (!n.hidden && !n.actor && !n.spawnPending && !n.spawnRequestTick) { n.spawnPending = true; pending.push_back({ n.uid, n.gen }); }
+        for (auto& n : g_npcReg) if (!n.hidden && !n.actor && !n.spawnPending && !n.spawnRequestTick && (!n.nextSpawnTick || (int32_t)(GetTickCount() - n.nextSpawnTick) >= 0)) { n.spawnPending = true; pending.push_back({ n.uid, n.gen }); }
     }
     for (const auto& p : pending) RunOnServerTick([p]() { SpawnManagedNpcNow(p.first, p.second); });
 }
@@ -5580,11 +5843,14 @@ bool MoveManagedNpc(int uid, Vec3 world) {
     return true;
 }
 bool SetManagedNpcControl(int uid, bool enabled, int behavior) {
-    behavior = behavior == 1 ? 1 : 0; bool needSync = false, changed = false;
+    behavior = behavior == 1 ? 1 : 0; if (behavior == 1) enabled = false;
+    bool needSync = false, changed = false; uintptr_t actor = 0;
     { std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid); if (i < 0 || g_npcReg[i].hidden) return false;
       ManagedNpc& n = g_npcReg[i]; changed = n.behavior != behavior || n.aiEnabled != enabled;
       n.behavior = behavior; n.aiEnabled = enabled; if (changed) MarkDirtyLocked(n.proj);
-      needSync = n.actor && n.aiApplied != n.aiEnabled; }
+      actor = n.actor; needSync = n.actor && n.aiApplied != n.aiEnabled; }
+    if (changed) Log("[npc] managed #%d AI requested=%s behavior=%d actor=%p%s", uid,
+        enabled ? "on" : "off", behavior, (void*)actor, needSync ? " (native sync queued)" : "");
     if (needSync) RunOnServerTick([uid]() { SyncManagedNpcAiNow(uid); });
     return true;
 }
@@ -5752,33 +6018,67 @@ static bool RunGroundCast(void* world, Vec3 start, float len, int tileX, int til
     return host::Seam().groundCast && host::Seam().groundCast(start, len, out);
 #else
     alignas(16) uint8_t q[0x200], xf[0x100], col[0x300], shp[0x200];
+    float originX = 0, originZ = 0;
     memset(col, 0, sizeof col);
     { std::lock_guard<std::mutex> l(g_tplMutex);
       if (!g_tpl.have || !g_origWorldCastShape) return false;
       world = g_tpl.world;
-      memcpy(q, g_tpl.query, sizeof q); memcpy(xf, g_tpl.xform, sizeof xf); memcpy(col, g_tpl.collector, sizeof g_tpl.collector); memcpy(shp, g_tpl.shape, sizeof shp); }
+      memcpy(q, g_tpl.query, sizeof q); memcpy(xf, g_tpl.xform, sizeof xf); memcpy(col, g_tpl.collector, sizeof g_tpl.collector); memcpy(shp, g_tpl.shape, sizeof shp);
+      originX = g_tpl.originX; originZ = g_tpl.originZ; }
     uintptr_t pShape = (uintptr_t)shp, pHits = (uintptr_t)col + 0x30; memcpy(q + 0x28, &pShape, 8); memcpy(col + 0x20, &pHits, 8);   // inline hit buffer at +0x30, as in the original object
     float* fq = (float*)q;
-    fq[0x30 / 4] = start.x - tileX * 1000.0f; fq[0x34 / 4] = start.y; fq[0x38 / 4] = start.z - tileZ * 1000.0f; fq[0x3C / 4] = 0;
+    // The query is relative to the physics world's captured origin, which can differ from the target's 1000 m tile.
+    // Re-tiling the point independently made casts across a tile boundary test a completely different location.
+    fq[0x30 / 4] = start.x - originX; fq[0x34 / 4] = start.y; fq[0x38 / 4] = start.z - originZ; fq[0x3C / 4] = 0;
     fq[0x40 / 4] = dir.x * len; fq[0x44 / 4] = dir.y * len; fq[0x48 / 4] = dir.z * len; fq[0x4C / 4] = 1.0f;   // displacement
     fq[0x50 / 4] = g_probeZeroVel ? 0.0f : dir.x * len; fq[0x54 / 4] = g_probeZeroVel ? 0.0f : dir.y * len; fq[0x58 / 4] = g_probeZeroVel ? 0.0f : dir.z * len; fq[0x5C / 4] = len;
     { const double big = 1e19; memcpy(col + 0x10, &big, 8); uint32_t zero = 0; memcpy(col + 0x0C, &zero, 4); }   // reset: no hit, early-out far away
-    if (verbose) { Log("[probe] cast: start (%.2f %.2f %.2f) tile %d,%d local (%.2f %.2f %.2f) down %.1f m", start.x, start.y, start.z, tileX, tileZ, fq[0x30 / 4], fq[0x34 / 4], fq[0x38 / 4], len); }
+    if (verbose) { Log("[probe] cast: start (%.2f %.2f %.2f) target tile %d,%d physics origin (%.0f %.0f) local (%.2f %.2f %.2f) down %.1f m", start.x, start.y, start.z, tileX, tileZ, originX, originZ, fq[0x30 / 4], fq[0x34 / 4], fq[0x38 / 4], len); }
     void* r = nullptr;
     if (!CallCastGuarded(world, q, xf, col, &r)) { const uintptr_t fa = (uintptr_t)cdk::t_fault.rec.ExceptionAddress; Log("[probe] replay crashed (caught): %08lx at %p (rva 0x%llx), address %p", cdk::t_fault.rec.ExceptionCode, (void*)fa, (unsigned long long)(InImage(fa) ? fa - g_base : 0), cdk::t_fault.rec.NumberParameters > 1 ? (void*)cdk::t_fault.rec.ExceptionInformation[1] : nullptr); return false; }
     uint32_t nh = 0; double frac = 0; memcpy(&nh, col + 0x0C, 4); memcpy(&frac, col + 0x10, 8);
     const float* fc = (const float*)col;
-    out->done = true; out->hit = nh > 0 && std::isfinite(frac) && frac <= 1.0; out->fraction = (float)frac;   // negative fraction = the cast started inside a body (penetration), reported as a hit so the caller can step lower
+    // A negative collector fraction is penetration, not a surface along this ray. Treating it as a hit extrapolates
+    // start - fraction * length above the cast; this has spawned NPCs over 12 km above the requested position.
+    out->done = true; out->hit = nh > 0 && std::isfinite(frac) && frac >= 0.0 && frac <= 1.0; out->fraction = (float)frac;
+    if (nh && std::isfinite(frac) && frac < 0.0) {
+        static int rejected = 0;
+        if (rejected++ < 30) Log("[probe] rejected penetrating hit fraction %.4f at (%.2f %.2f %.2f)", frac, start.x, start.y, start.z);
+    }
     out->centerY = start.y + dir.y * (float)frac * len; out->normal = { fc[0x80 / 4], fc[0x84 / 4], fc[0x88 / 4] };
     out->center = { start.x + dir.x * (float)frac * len, out->centerY, start.z + dir.z * (float)frac * len };
     if (verbose) Log("[probe] RESULT hits %u fraction %.4f -> sphere center y %.3f (%.2f m below start), normal (%.3f %.3f %.3f), returned %p", nh, frac, out->centerY, (float)frac * len, out->normal.x, out->normal.y, out->normal.z, r);
     return true;
 #endif
 }
+// Character ground casts are short. Replaying one 400-1000 m sweep often returns no hit even over loaded terrain;
+// walk short, overlapping sweeps from top to bottom and take the first physical surface.
+static bool RunGroundSweep(void* world, Vec3 start, float len, int tileX, int tileZ, GroundHit* out, bool verbose, Vec3 dir = Vec3{ 0, -1, 0 }) {
+    if (!std::isfinite(len) || len <= 0.0f || len > 2000.0f) return false;
+    const float segment = 32.0f, overlap = 0.25f;
+    GroundHit last{};
+    for (float travelled = 0; travelled < len; travelled += segment) {
+        const float reach = std::min(len - travelled, segment + overlap);
+        const Vec3 from{ start.x + dir.x * travelled, start.y + dir.y * travelled, start.z + dir.z * travelled };
+        GroundHit h{};
+        if (!RunGroundCast(world, from, reach, tileX, tileZ, &h, verbose, dir)) return false;
+        last = h;
+        if (!h.hit) continue;
+        h.fraction = (travelled + h.fraction * reach) / len;
+        *out = h;
+        return true;
+    }
+    *out = last;
+    out->hit = false;
+    out->fraction = 1.0f;
+    out->center = { start.x + dir.x * len, start.y + dir.y * len, start.z + dir.z * len };
+    out->centerY = out->center.y;
+    return true;
+}
 static int QueueGround(Vec3 start, float len, bool verbose, uint64_t epoch, const GroundHandle& op = {}, Vec3 dir = Vec3{ 0, -1, 0 }, bool robust = false) {
     std::lock_guard<std::mutex> l(g_groundMutex); const int id = ++g_groundNext;
     g_groundQueue.push_back({ id, start, len, verbose, epoch, op, bool(op), dir, robust });
-    g_groundResults[id] = { {}, epoch, op, bool(op) }; // admission identity survives queue dispatch and world invalidation
+    g_groundResults[id] = { {}, epoch, op, bool(op), GroundProbeStatus::Pending, start, len, false }; // admission identity survives queue dispatch and world invalidation
     if (g_groundResults.size() > 40000) g_groundResults.erase(g_groundResults.begin()); // evicted -> explicit Unknown, never Pending
     InterlockedExchange(&g_groundQueued, 1); return id;
 }
@@ -5818,7 +6118,7 @@ static void ServiceGroundQueue(void* world) {   // physics thread, inside the ga
         t_geoTracing = InterlockedExchange(&g_geoTraceArm, 0) != 0;   // research: log the geometry calls of this one cast
         if (t_geoTracing) Log("[geo] ---- traced cast from (%.2f %.2f %.2f) %.2f m down", rq.start.x, rq.start.y, rq.start.z, rq.len);
         GroundHit h;
-        if (!RunGroundCast(world, rq.start, rq.len, tx, tz, &h, rq.verbose, rq.dir)) { h.done = true; h.hit = false; }
+        if (!RunGroundSweep(world, rq.start, rq.len, tx, tz, &h, rq.verbose, rq.dir)) { h.done = true; h.hit = false; }
         // The captured character sphere cast can occasionally fall through one terrain heightfield quad (documented in
         // notes/FORMATS.md) and return a perfectly valid hit on geometry below the ground. For editor ground queries only,
         // compare the centre cast with four nearby casts. Preserve a normal centre hit (important for bridges/platforms);
@@ -5832,7 +6132,7 @@ static void ServiceGroundQueue(void* world) {   // physics thread, inside the ga
                 const Vec3 s{ rq.start.x + off[k][0], rq.start.y, rq.start.z + off[k][1] };
                 const int stx = (int)(s.x * 0.001f), stz = (int)(s.z * 0.001f);
                 GroundHit qh;
-                if (RunGroundCast(world, s, rq.len, stx, stz, &qh, false, rq.dir) && qh.hit && std::isfinite(qh.centerY)) {
+                if (RunGroundSweep(world, s, rq.len, stx, stz, &qh, false, rq.dir) && qh.hit && std::isfinite(qh.centerY)) {
                     ns[nn].h = qh; ns[nn].y = qh.centerY - radius; nn++;
                 }
             }
@@ -5870,7 +6170,8 @@ static void ServiceGroundQueue(void* world) {   // physics thread, inside the ga
           const auto stored = g_groundResults.find(rq.id);
           if (stored == g_groundResults.end()) continue; // a consumed invalidation cannot publish a late physical hit
           stored->second.hit = h;
-          stored->second.status = invalid ? GroundProbeStatus::Invalidated : h.hit ? GroundProbeStatus::Hit : GroundProbeStatus::Miss;
+          stored->second.terrainFallback = !invalid && !h.hit && rq.robust && rq.dir.y < -0.99f;
+          stored->second.status = invalid ? GroundProbeStatus::Invalidated : h.hit ? GroundProbeStatus::Hit : stored->second.terrainFallback ? GroundProbeStatus::Pending : GroundProbeStatus::Miss;
         }
     }
     s_inside = false;
@@ -5916,7 +6217,26 @@ GroundProbeStatus GroundResultState(int ticket, GroundHit* out) {
     std::lock_guard<std::mutex> queue(g_groundMutex);
     const auto it = g_groundResults.find(ticket);
     if (it == g_groundResults.end()) return GroundProbeStatus::Unknown;
-    const auto status = it->second.epoch != g_groundEpoch ? GroundProbeStatus::Invalidated : it->second.status;
+    auto status = it->second.epoch != g_groundEpoch ? GroundProbeStatus::Invalidated : it->second.status;
+    if (status == GroundProbeStatus::Pending && it->second.terrainFallback) {
+        float terrainY = 0;
+        const int sample = TerrainQueryHeight(it->second.start.x, it->second.start.z, &terrainY);
+        if (sample != 0) {
+            auto& stored = it->second;
+            // A height texture has no bridge/prop collision. Use it only after the physical query missed.
+            // A slight inset absorbs the known sub-metre DDS vs collision-height difference and avoids floating.
+            if (sample > 0 && std::isfinite(terrainY) && terrainY <= stored.start.y && terrainY >= stored.start.y - stored.len) {
+                stored.hit.done = stored.hit.hit = true;
+                stored.hit.centerY = terrainY - 0.15f; stored.hit.radius = 0.0f;
+                stored.hit.center = { stored.start.x, stored.hit.centerY, stored.start.z };
+                stored.hit.normal = { 0, 1, 0 };
+                stored.hit.fraction = (stored.start.y - terrainY) / stored.len;
+                status = stored.status = GroundProbeStatus::Hit;
+                static int s_fallbackLogs = 0;
+                if (s_fallbackLogs++ < 30) Log("[ground] physics missed; terrain height fallback at (%.2f %.2f) = %.2f", stored.start.x, stored.start.z, terrainY);
+            } else status = stored.status = GroundProbeStatus::Miss;
+        }
+    }
     if (status == GroundProbeStatus::Pending) return status;
     if (status == GroundProbeStatus::Hit || status == GroundProbeStatus::Miss) *out = it->second.hit;
     g_groundResults.erase(it); // invalidation is consumed as its own outcome, never synthesized as a miss
@@ -6360,6 +6680,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     InstallIoTrace();
     overlay::Install();          // first: must be in place before the game creates its swapchain
     LoadPrefabs();
+    LoadNativeWorldOverrides();
     if (g_httpEnabled) httpapi::Start(g_httpPort);   // opt-in; before ResolveGame on purpose: /api/status reports a failed build, writes answer 503
     thumbgen::Start();           // background: renders prefab previews from the pack files into bin64\cdmodkit\thumbs
     g_buildOk = ResolveGame();
